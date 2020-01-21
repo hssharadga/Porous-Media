@@ -9,7 +9,7 @@ Created on Tue Jan 21 14:22:32 2020
 maxIterations = 1E6;
 W=2438; 
 H=W/2;  
-densityDesired = 0.7
+densityDesired = 0.4
 Radius = 50
 minGap= 10 ## gab between circle
 borderGap = 25 ## gab between border and the nearest circle
@@ -75,3 +75,7 @@ print ('densityBorder:',densityBorder * 100)
 print ('number of sphere: ',len(Center))
 print ('number of iteration :',iterations)
 
+#Saving the results in a file
+with open('Circels.csv', "w", newline = '') as output: ## Circles is the name of excel file that will be produced
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(Center) ## Center is waht I want the python to write out
