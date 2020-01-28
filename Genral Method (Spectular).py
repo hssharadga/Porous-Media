@@ -4,13 +4,6 @@ Created on Fri Jan 24 13:27:18 2020
 
 @author: hssharadga
 """
-
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Jan 22 19:03:52 2020
-
-@author: hssharadga
-"""
 import numpy as np
 from numpy import linalg as LA
 from math import sqrt, asin,acos, pi, sin, cos, exp,tan,atan
@@ -39,10 +32,12 @@ xx1 = data.tolist()
 
 
 ## inputs
-Num=1000# number of iterations
+# note: update sp_x
+
+Num=1# number of iterations
 D = 100 #sphere diameter(cm)
 eta = 0.4 #absorbtivity
-nta = 20000 #refractive index
+nta = 2000 #refractive index
 ex = 0.3 #extinction coefficient
 nta_air = 1.0003
 ymax=2483/2
@@ -51,11 +46,9 @@ ymin=0
 xmax=2483
 xmin=0
 #y1=xmax/2*tan(30*pi/180)# the source of light; distance to the bottom of the porous
-
-
 y1=-D # it should be closed or less than the distance of travling to hit the sphere of first raw
 dim = np.array([[xmin,ymin],[xmax,ymax]]) #bed dimentions start to end in the groung frame(cm)
-l=2000# the length of ray is eougth to hit at leasat one sphere
+l=20*D# the length of ray is eougth to hit at leasat one sphere
 ##############################################3
 
 
@@ -73,20 +66,18 @@ for i in range(Num):
 #initial ray
     # random initial point for sending the ray in the particle bed 
     sp_x = xmax/2 +(0.5-((random.random())))* 0.6*xmax
-    print (sp_x)
+#    print (sp_x)
 #    sp_x=xmax/2
     p1= np.array([sp_x,y1])# the source of light; firsit point
     ## 
     dir_cos_ini = np.array([0,1])# the firsit direction will be with angel 90
     
     
-    # Direction cosines of the ground frame
-#    i1 = np.array([1,0,0])
-#    j1 = np.array([0,1,0])
-#    k1 = np.array([0,0,1])
+
     #pts is a list to add all the points being hit by the ray and dir_cos is the list to save direction cosines
     pts = np.array([0,0])
     pts = np.vstack((pts,p1))
+    all_point=pts[:]
     dir_cos = np.array([0,0])
     dir_cos = np.vstack((dir_cos,dir_cos_ini))
     sphere_centers_hit = np.array([[0,0],[0,0]]) # all the spheres being hit by the ray
@@ -122,7 +113,7 @@ for i in range(Num):
             Dis_center_to_line = sqrt(w**2 + h**2)
             if Dis_center_to_line < D/2:
                 sphere_hitting= np.vstack((sphere_hitting,a))
-        print (sphere_hitting)
+#        print (sphere_hitting)
         #checking if the ray is not hitting any particles then it has left the bed and thus checking which boundary did the ray leave
         if len(pts)>2:
 #            p3 = np.array([pts[ii][0]+dir_cos[ii][0]*D,pts[ii][1]+dir_cos[ii][1]*D])
@@ -150,6 +141,7 @@ for i in range(Num):
 #Code for finding the points on this spphere that are hit by the ray and then selecting the first hit point
         p1 = np.squeeze(np.asarray(p1))
         p2 = np.squeeze(np.asarray(p2))
+        
         u = (p2[0] - p1[0])**2+(p2[1] - p1[1])**2
         v = 2*(((p2[0] - p1[0])*(-sphere_being_hit_center[0]+p1[0])) + ((p2[1] - p1[1])*(-sphere_being_hit_center[1]+p1[1])))
         w = (sphere_being_hit_center[0]-p1[0])**2 + (sphere_being_hit_center[1]-p1[1])**2-(D/2)**2
@@ -164,29 +156,38 @@ for i in range(Num):
         else:
             ep = ep2
 #Code for finding whether tha ray is getting refracted or reflected
-        if ep[1]< ymax and ep[1]>0:
+        if ep[1]< ymax and ep[1]>ymin:
             normal = np.array([ep[0]-C[0],ep[1]-C[1]])
             norm = LA.norm(normal)
             normal_dir_cos = np.array([normal[0]/norm, normal[1]/norm])
-            phi = acos(np.dot(-normal_dir_cos,dir_cos[ii]))
+            phi = acos(np.dot(-normal_dir_cos,dir_cos[ii])) ##cos(theta_incident)=N.I since N= final - inital
+            #that mean it exit the sphere at the hitting point but according to the figure of the refernce; N cut the sphere completely
             phi2 = asin(nta_air*sin(phi)/nta)
             rho_parallel = (nta*cos(phi)-nta_air*cos(phi2))/(nta*cos(phi)+nta_air*cos(phi2))
-            rho_perpendicular = (nta_air*cos(phi)-nta*cos(phi2))/(nta_air*cos(phi)+nta*cos(phi2))
+            rho_perpendicular = (nta_air*cos(phi2)-nta*cos(phi))/(nta_air*cos(phi2)+nta*cos(phi))
+            
             trans_parallel = (2*sin(phi2)*cos(phi))/(sin(phi+phi2)*cos(phi-phi2))
             trans_perpendicular = (2*sin(phi2)*cos(phi))/(sin(phi+phi2))
+            
             rho_avg = (rho_parallel**2 + rho_perpendicular**2)/2
             trans_avg = (trans_parallel**2 + trans_perpendicular**2)/2    
             rand1 = np.random.random(1)[0]
             
             
             
+            
             if rand1< rho_avg: # spectral reflection
                 dot_prod = np.dot(normal_dir_cos,dir_cos[ii])
+                
+                ## R= I - 2 *(N.I) N
+                ## here N if postive or negatvie it dose not matter becuase the N twice
                 reflected_dir_cos1 = np.array([(dir_cos[ii][0] - 2*normal_dir_cos[0]*dot_prod), (dir_cos[ii][1] - 2*normal_dir_cos[1]*dot_prod)])
                 norm1 = LA.norm(reflected_dir_cos1)
                 reflected_dir_cos = np.array([reflected_dir_cos1[0]/norm1,reflected_dir_cos1[1]/norm1])
                 angel_inci_reflect = acos(np.dot(reflected_dir_cos,normal_dir_cos))
                 pts = np.vstack((pts,ep))
+                all_point=np.vstack((all_point,ep))
+                
                 dir_cos = np.vstack((dir_cos,reflected_dir_cos))
                 ii = ii+1
                 I = I - I*eta
@@ -207,6 +208,8 @@ for i in range(Num):
                  # find the final point after the ray has refracted and travelled through the sphere
                 p1 = ep
                 p2 = np.array([p1[0]+refracted_dir_cos[0]*1,p1[1]+refracted_dir_cos[1]*1])
+                
+                
                 u = (p2[0] - p1[0])**2+(p2[1] - p1[1])**2
                 v = -2*((p2[0] - p1[0])*(C[0]-ep[0])) + -2*((p2[1] - p1[1])*(C[1]-ep[1]))
                 w = (C[0]-ep[0])**2+(C[1]-ep[1])**2-(D/2)**2
@@ -229,9 +232,12 @@ for i in range(Num):
                 pts = np.vstack((pts,ep2))
                 dir_cos = np.vstack((dir_cos,refracted_dir_cos3))
                 ii = ii+1
-                I = I - I*eta # need to decide how much enerfy gets lost 
+                I = I - I*eta # need to decide how much enerfy gets lost
+                
+                all_point1=np.vstack((all_point,ep))
+                all_point=np.vstack((all_point1,ep2))
         
-        elif ep[1]< ymax:
+        elif ep[1]< ymin:
             I = I
             E2.append(I)
             break

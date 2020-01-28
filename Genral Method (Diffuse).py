@@ -32,23 +32,24 @@ xx1 = data.tolist()
 
 
 ## inputs
-Num=1000# number of iterations
-D = 100 #sphere diameter(cm)
+
+# note: update sp_x
+Num=1# number of iterations
+D = 100 #sphere diameter
 eta = 0.4 #absorbtivity
-nta = 20000 #refractive index
+nta = 2 #refractive index
 ex = 0.3 #extinction coefficient
 nta_air = 1.0003
-ymax=2483/2
-ymin=0
-
 xmax=2483
 xmin=0
+ymax=xmax/2
+ymin=0
+
+
 #y1=xmax/2*tan(30*pi/180)# the source of light; distance to the bottom of the porous
-
-
-y1=-D # it should be closed or less than the distance of travling to hit the sphere of first raw
+y1=-D # (distance to the bottom of the porous) it should be closed or less than the distance of travling to hit the sphere of first raw
 dim = np.array([[xmin,ymin],[xmax,ymax]]) #bed dimentions start to end in the groung frame(cm)
-l=2000# the length of ray is eougth to hit at leasat one sphere
+l=20*D# the length of ray is eougth to hit at leasat one sphere
 ##############################################3
 
 
@@ -66,20 +67,18 @@ for i in range(Num):
 #initial ray
     # random initial point for sending the ray in the particle bed 
     sp_x = xmax/2 +(0.5-((random.random())))* 0.6*xmax
-    print (sp_x)
+#    print (sp_x)
 #    sp_x=xmax/2
     p1= np.array([sp_x,y1])# the source of light; firsit point
     ## 
     dir_cos_ini = np.array([0,1])# the firsit direction will be with angel 90
     
     
-    # Direction cosines of the ground frame
-#    i1 = np.array([1,0,0])
-#    j1 = np.array([0,1,0])
-#    k1 = np.array([0,0,1])
+
     #pts is a list to add all the points being hit by the ray and dir_cos is the list to save direction cosines
     pts = np.array([0,0])
     pts = np.vstack((pts,p1))
+    all_point=pts[:]
     dir_cos = np.array([0,0])
     dir_cos = np.vstack((dir_cos,dir_cos_ini))
     sphere_centers_hit = np.array([[0,0],[0,0]]) # all the spheres being hit by the ray
@@ -95,11 +94,11 @@ for i in range(Num):
         p2 = np.reshape(p2,(1,2))
         sphere_hitting = np.array([[0,0],[0,0]]) # list being inicialized at each step to save all the spheres being hit by this ray so that later we can calculate the the first(nearest) hit point and sphere 
         particle_data_new = X[:] # data from which the sphere hit from lst iteration will be deleted to have proper further calculations
+        
         if ii >1: # supressing first iteration
             index1,index2= np.where(X == C)  # finding the index of last hit sphere
             del particle_data_new[index1[1]] # deleting the last hit sphere
        
-        
         # code for finding all the spheres being hit by finding the distance of the centers from this ray and the saving the particles with distance less than D/2(radius)
         for a in particle_data_new[0:]:
             b = np.array(a)
@@ -115,7 +114,7 @@ for i in range(Num):
             Dis_center_to_line = sqrt(w**2 + h**2)
             if Dis_center_to_line < D/2:
                 sphere_hitting= np.vstack((sphere_hitting,a))
-        print (sphere_hitting)
+#        print (sphere_hitting)
         #checking if the ray is not hitting any particles then it has left the bed and thus checking which boundary did the ray leave
         if len(pts)>2:
 #            p3 = np.array([pts[ii][0]+dir_cos[ii][0]*D,pts[ii][1]+dir_cos[ii][1]*D])
@@ -157,16 +156,19 @@ for i in range(Num):
         else:
             ep = ep2
 #Code for finding whether tha ray is getting refracted or reflected
-        if ep[1]< ymax and ep[1]>0:
+        if ep[1]< ymax and ep[1]>ymin:
             normal = np.array([ep[0]-C[0],ep[1]-C[1]])
             norm = LA.norm(normal)
             normal_dir_cos = np.array([normal[0]/norm, normal[1]/norm])
-            phi = acos(np.dot(-normal_dir_cos,dir_cos[ii]))
+            phi = acos(np.dot(-normal_dir_cos,dir_cos[ii])) ##cos(theta_incident)=N.I since N= final - inital
+            #that mean it exit the sphere at the hitting point but according to the figure of the refernce; N cut the sphere completely
             phi2 = asin(nta_air*sin(phi)/nta)
             rho_parallel = (nta*cos(phi)-nta_air*cos(phi2))/(nta*cos(phi)+nta_air*cos(phi2))
-            rho_perpendicular = (nta_air*cos(phi)-nta*cos(phi2))/(nta_air*cos(phi)+nta*cos(phi2))
+            rho_perpendicular = (nta_air*cos(phi2)-nta*cos(phi))/(nta_air*cos(phi2)+nta*cos(phi))
+            
             trans_parallel = (2*sin(phi2)*cos(phi))/(sin(phi+phi2)*cos(phi-phi2))
             trans_perpendicular = (2*sin(phi2)*cos(phi))/(sin(phi+phi2))
+            
             rho_avg = (rho_parallel**2 + rho_perpendicular**2)/2
             trans_avg = (trans_parallel**2 + trans_perpendicular**2)/2    
             rand1 = np.random.random(1)[0]
@@ -177,45 +179,36 @@ for i in range(Num):
           
             
             if rand1< rho_avg: # Diffuse reflection
-#                k3 = normal_dir_cos
-#                norm3 = np.cross(k3,k1)
-#                i3 = (np.cross(k3,k1))/LA.norm(norm3)
-#                j3 = np.cross(k3,i3)
-#                rot3 = np.array([[i3],[j3],[k3]])#rotation matrix to get direction cosines in the ground frame
-#                rot3 = rot3.transpose()
-#                R_gamma2 = np.random.random(1)[0] #getting the center of the sphere being hit
+
                 R_theta2 = np.random.random(1)[0]
-#                gamma2 = asin(1 - 2*R_gamma2)
+
                 theta2 = pi*R_theta2
                 
                 
-#                reflected_dir_cos1 = np.array([sin(gamma2)*cos(theta2), sin(gamma2)*sin(theta2), cos(gamma2)])
-#                reflected_dir_cos = np.matmul(rot3,reflected_dir_cos1)
-                
                 reflected_dir_cos1 = np.array([cos(theta2),sin(theta2)])
 
-                # theta
+                # theta of rotation = 90-theta of normal
                 
-                theta_x_axis=atan(normal_dir_cos[1]/normal_dir_cos[0])
+                theta_x_axis=atan(abs(normal_dir_cos[1]/normal_dir_cos[0]))
                 
                 if normal_dir_cos[1]>0 and normal_dir_cos[0]>0:
                     theta_of_normal=theta_x_axis
                     
                 elif normal_dir_cos[1]>0 and normal_dir_cos[0]<0:
-                    theta_of_normal=180-theta_x_axis
+                    theta_of_normal=pi-theta_x_axis
                     
                 elif normal_dir_cos[1]<0 and normal_dir_cos[0]<0:
-                    theta_of_normal=180+theta_x_axis
+                    theta_of_normal=pi+theta_x_axis
                     
                 else:
-                    theta_of_normal=360-theta_x_axis
+                    theta_of_normal=2*pi-theta_x_axis
                     
                     
                 
                 
                 
                 theta_of_vector=theta_of_normal
-                angle_rotation=(90*pi/180)-theta_of_vector    
+                angle_rotation=(pi/2)-theta_of_vector    
                 rot=np.array([[cos(angle_rotation), sin(angle_rotation)],[-sin(angle_rotation), cos(angle_rotation)]])
                 reflected_dir_cos=np.matmul(rot, reflected_dir_cos1)
 
@@ -224,37 +217,47 @@ for i in range(Num):
                 reflected_dir_cos = np.reshape(reflected_dir_cos, (1, 2))
                 dir_cos = np.vstack((dir_cos,reflected_dir_cos))
                 pts = np.vstack((pts,ep))
+                all_point=np.vstack((all_point,ep))
                 ii = ii+1
                 I = I - I*eta # loss of intensity due to collision
     
             else: #refraction
                 n = nta_air/nta
-                cphi = np.dot(-normal_dir_cos,dir_cos[ii])
+                cphi = np.dot(-normal_dir_cos,dir_cos[ii])# cos(phi)
                 phi = acos(np.dot(-normal_dir_cos,dir_cos[ii]))
                 phi2 = asin(n*sin(phi))
-                c1 = np.dot(-normal_dir_cos,dir_cos[ii])
-                c2 = 1 - ((n**2)*(1-cphi**2))
+                
+                c1 = np.dot(-normal_dir_cos,dir_cos[ii])# C1=N.I  (N and I direction)
+                c2 = 1 - ((n**2)*(1-cphi**2))  # c2^2= 1- (n1/n2)^2*(1-cos(phi)^2)
                 # refracted direction cosines
                 refracted_dir_cos1 = np.array([(n)*(dir_cos[ii][0]) +(n*cphi-sqrt(c2))*normal_dir_cos[0], (n)*(dir_cos[ii][1]) +(n*cphi-sqrt(c2))*normal_dir_cos[1]])
+               ## T= nI+(nC1-C2)N
+                
                 norm1 = LA.norm(refracted_dir_cos1)
                 refracted_dir_cos = np.array([refracted_dir_cos1[0]/norm1,refracted_dir_cos1[1]/norm1])
                  # find the final point after the ray has refracted and travelled through the sphere
                 p1 = ep
                 p2 = np.array([p1[0]+refracted_dir_cos[0]*1,p1[1]+refracted_dir_cos[1]*1])
+                #there the final point assume with length 1, becuae it the vector assume infinity when calcualte the point of itersections
+                
                 u = (p2[0] - p1[0])**2+(p2[1] - p1[1])**2
                 v = -2*((p2[0] - p1[0])*(C[0]-ep[0])) + -2*((p2[1] - p1[1])*(C[1]-ep[1]))
                 w = (C[0]-ep[0])**2+(C[1]-ep[1])**2-(D/2)**2
                 t1 = (-v + sqrt(v**2-(4*u*w)))/(2*u)
                 ep2 = np.array([ep[0]+ t1*(p2[0] - p1[0]), ep[1]+ t1*(p2[1] - p1[1])])
+                
+                
+                # distance moved through the sphere
                 s = sqrt((ep2[0]-ep[0])**2 + (ep2[1]-ep[1])**2)
+                #######################################################
                 normal2 = np.array([ep2[0]-C[0],ep2[1]-C[1]])
                 norm2 = LA.norm(normal2)
                 normal_dir_cos2 = np.array([normal2[0]/norm2, normal2[1]/norm2])
                 b1 = nta/nta_air
                 phi3 = acos(np.dot(normal_dir_cos2,refracted_dir_cos))
                 phi4 = asin(b1*sin(phi3))
-                #print(phi4)                         
-                c3 = np.dot(normal_dir_cos2,refracted_dir_cos)
+                print(phi4*180/pi)                         
+                c3 = np.dot(normal_dir_cos2,refracted_dir_cos) #like C1
                 c4 = 1 - ((b1**2)*(1-c3**2))
                 refracted_dir_cos2 = np.array([(b1)*(refracted_dir_cos[0]) - (b1*c3-sqrt(c4))*normal_dir_cos2[0], (b1)*(refracted_dir_cos[1]) - (b1*c3-sqrt(c4))*normal_dir_cos2[1]])
                 norm3 = LA.norm(refracted_dir_cos2)
@@ -263,15 +266,21 @@ for i in range(Num):
                 pts = np.vstack((pts,ep2))
                 dir_cos = np.vstack((dir_cos,refracted_dir_cos3))
                 ii = ii+1
-                I = I - I*eta # need to decide how much enerfy gets lost 
+                I = I - I*eta # need to decide how much enerfy gets lost
+                
+                all_point1=np.vstack((all_point,ep))
+                all_point=np.vstack((all_point1,ep2))
         
-        elif ep[1]< ymax:
+        elif ep[1]< ymin:
             I = I
             E2.append(I)
             break
         else:
             E1.append(I)
-            break                
+            break  
+
+
+              
 print ('Transmitted', sum(E1))
 print ('reflected',sum(E2)) 
 print ('escape',sum(E3))
