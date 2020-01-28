@@ -42,13 +42,12 @@ ex = 0.3 #extinction coefficient
 nta_air = 1.0003
 ymax=2483/2
 ymin=0
-
 xmax=2483
 xmin=0
 #y1=xmax/2*tan(30*pi/180)# the source of light; distance to the bottom of the porous
 y1=-D # it should be closed or less than the distance of travling to hit the sphere of first raw
 dim = np.array([[xmin,ymin],[xmax,ymax]]) #bed dimentions start to end in the groung frame(cm)
-l=20*D# the length of ray is eougth to hit at leasat one sphere
+l=10*D# the length of ray is eougth to hit at leasat one sphere
 ##############################################3
 
 
@@ -66,8 +65,6 @@ for i in range(Num):
 #initial ray
     # random initial point for sending the ray in the particle bed 
     sp_x = xmax/2 +(0.5-((random.random())))* 0.6*xmax
-#    print (sp_x)
-#    sp_x=xmax/2
     p1= np.array([sp_x,y1])# the source of light; firsit point
     ## 
     dir_cos_ini = np.array([0,1])# the firsit direction will be with angel 90
@@ -118,6 +115,9 @@ for i in range(Num):
         if len(pts)>2:
 #            p3 = np.array([pts[ii][0]+dir_cos[ii][0]*D,pts[ii][1]+dir_cos[ii][1]*D])
             if len(sphere_hitting)<3:
+              
+                all_point=np.vstack((all_point,p2))
+                
                 if p2[0][1]<ymin: # reflection
                     E2.append(I)
                 if p2[0][1]>ymax: # transmitted

@@ -119,6 +119,9 @@ for i in range(Num):
         if len(pts)>2:
 #            p3 = np.array([pts[ii][0]+dir_cos[ii][0]*D,pts[ii][1]+dir_cos[ii][1]*D])
             if len(sphere_hitting)<3:
+                
+                all_point=np.vstack((all_point,p2))
+                
                 if p2[0][1]<ymin: # reflection
                     E2.append(I)
                 if p2[0][1]>ymax: # transmitted
@@ -256,7 +259,7 @@ for i in range(Num):
                 b1 = nta/nta_air
                 phi3 = acos(np.dot(normal_dir_cos2,refracted_dir_cos))
                 phi4 = asin(b1*sin(phi3))
-                print(phi4*180/pi)                         
+#                print(phi4*180/pi)                         
                 c3 = np.dot(normal_dir_cos2,refracted_dir_cos) #like C1
                 c4 = 1 - ((b1**2)*(1-c3**2))
                 refracted_dir_cos2 = np.array([(b1)*(refracted_dir_cos[0]) - (b1*c3-sqrt(c4))*normal_dir_cos2[0], (b1)*(refracted_dir_cos[1]) - (b1*c3-sqrt(c4))*normal_dir_cos2[1]])
