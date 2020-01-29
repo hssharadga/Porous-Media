@@ -250,4 +250,10 @@ print ('escape',sum(E3))
 
 stop = timeit.default_timer()
 
-print('Time: ', stop - start)       
+print('Time: ', stop - start)
+
+
+with open('all_point.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(all_point)
+              

@@ -10,9 +10,11 @@ Created on Tue Jan 21 17:26:32 2020
 # this point is called the emission point then we emit random ray using a random angle then we convert this direction to the ground frame using rotation matrix
 # then we find the sphere being hiited be calcuating the distance and then find the closeest sphere
 # the closest sphere is hitted at two point, we find the closeest one
+## here we do not take the whole domain of porous media to make sure that light will hit at least one sphere
+# after getting the penetration length we use the other code and we assume the dimssion is infinty for x 
+
 
 ##input 
-
 D = 100  # diameter of the particle
 Num=1000 # number of iteration
 xlow=200
@@ -21,6 +23,7 @@ ylow=200
 yhigh=2000/2
 
 l=10*D
+gab=10
 #################
 
 
@@ -71,10 +74,7 @@ for i in range(Num): # number of iterations
     ## this sphere should not be taken because the distance between sphere and it seld is zero
     
 #Code to get the direction cosines of the emitted ray in the ground frame making sure that this ray doesn't penetrate any sphere
-# Direction cosines of the ground frame
-#    i1 = np.array([1,0,0])
-#    j1 = np.array([0,1,0])
-#    k1 = np.array([0,0,1])
+
     
 #radom point on the selected sphere
     
@@ -98,50 +98,13 @@ for i in range(Num): # number of iterations
 #direction cosines of the ray in secondary co-ordinate frame
     dir_cos_line = np.array([cos(theta1), sin(theta1)])
     
+    
+#    # Rotation matrix to get the direction of emitted ray in the ground frame
     theta_of_vector=theta
     angle_rotation=(90*pi/180)-theta_of_vector    
     rot=np.array([[cos(angle_rotation), sin(angle_rotation)],[-sin(angle_rotation), cos(angle_rotation)]])
     dir_cos_line_grdframe=np.matmul(rot, dir_cos_line)
-    
-    
-#    # Rotation matrix to get the direction of emitted ray in the ground frame
-#    #K2 is the rotation axis
-#    k2_ = np.array([emission_point[0],emission_point[1]])
-#    norm1 =LA.norm(k2_)
-#    k2 = k2_/norm1
-#    norm2 = np.cross(k2,k1)
-#    i2 = (np.cross(k2,k1))/LA.norm(norm2)
-#    j2 = np.cross(k2,i2)
-##rotation matrix to get direction cosines in the ground frame
-#    rot = np.array([[i2],[j2],[k2]])
-#    rot = rot.transpose()
-#    
-##direction cosines in the ground frame
-#    dir_cos_line_grdframe = dir_cos_line
-#    
-##    dir_cos_line_grdframe = np.matmul(rot,dir_cos_line)
-    # convert the direction of ray to the ground frame
-    
-    
-#    if theta>=0 and theta<=90:
-#        angle_rotation=90-theta
-#    elif:
-#        theta>90 and theta<=180:
-#        angle_rotation=90-theta
-#    elif:
-#        thet180>0 and theta<=270:
-#        angle_rotation=90-theta
-#    else:
-#        theta>=0 and theta<=90:
-#        angle_rotation=90-theta 
-#        
-#        
-        
 
-        
-        
-
-#    dir_cos_line_grdframe=np.array([cos(theta1-(90*(pi/180)-theta)),sin(theta1-(90*(pi/180)-theta))])
     
 #initializing the array to save the final result
     sphere_hitting = np.array([[0,0],[0,0]])
@@ -196,7 +159,7 @@ for i in range(Num): # number of iterations
     w = (closest_sphere[0]-emission_point[0])**2+(closest_sphere[1]-emission_point[1])**2-(D/2)**2
     t1 = (-v + sqrt(v**2-4*u*w))/(2*u)
     t2 = (-v - sqrt(v**2-4*u*w))/(2*u)
-    
+    # t is the distance the ray move from the firsit point
     # two point on the sphere ep1, ep2. We have to check which one is the closet
     
     ep1 = np.array([emission_point[0]+(p2[0]-p1[0])*t1,emission_point[1]+(p2[1]-p1[1])*t1])

@@ -13,12 +13,14 @@ Created on Tue Jan 21 20:27:44 2020
 # after we calcuale the the direction we emit the ray with length of penetration length again
 # and keep tracing 
 
+# the origin is (0,0), the dimission is infinity in x but determined for y
+
 import numpy as np
 from numpy import linalg as LA
 from math import sqrt, asin,acos, pi, sin, cos, tan, exp,atan
 import random
 import timeit
-
+import csv
 start = timeit.default_timer()
 
 
@@ -42,24 +44,24 @@ penetration_len = data
 
 
 # inputs
-Num=1000 # number of iterations
+Num=1 # number of iterations
 D = 100 #sphere diameter(cm)
 eta = 0.4 #absorbtivity
-nta = 20000 #refractive index
+nta = 2 #refractive index
 ex = 0.3 #extinction coefficient
 nta_air = 1.0003
 A = np.array([2438,2438/2]) #bed dimentions(cm)
-
+gab=10
 
 E1 = [] #save intencities that gets transmitted
 E2 = [] # saves intencities that are reflected
 
+
+
+
 for i in range(Num): #number of iterations
 #ground frame
     print ('Number of iterations = ',i)
-    i1 = np.array([1,0,0])
-    j1 = np.array([0,1,0])
-    k1 = np.array([0,0,1])
     
     
     o = np.array([0,0])# origin
@@ -68,11 +70,13 @@ for i in range(Num): #number of iterations
 #direction cosines of the ray
     ll = random.choice(penetration_len) #select a random penetration length from the data
     l=ll[0]
+    
     #l = (1+np.random.random(1)[0])*D
 
     R_theta = np.random.random(1)[0]
     
-    theta = pi*R_theta# pi to make sure that the ray toward up and dose not go down, the starting point is (0,0)
+    theta = pi*R_theta# pi to make sure that the ray toward up and dose not go down, 
+    # the starting point is (0,0), thus there is no need for rotation matrix
     dir_cos = np.array([cos(theta),sin(theta)])
     Dir_cosines = np.array([0,0])
     Dir_cosines = np.vstack((Dir_cosines,dir_cos)) #array to save all the direction cosines of the ray
@@ -84,13 +88,20 @@ for i in range(Num): #number of iterations
     ii = 1  
     iii= 0
     
+    all_point=x[:]
+  
     while I > 1E-10:
+    
+
+        
+        
+        
         overlap = False
 # skipping the first step when end point is already known       
         if len(x)> 2:
             ll = random.choice(penetration_len)
             l=ll[0]
-            #l = (0.5+np.random.random(1)[0])*D #in case we don't have data for penetration length
+           #l = (0.5+np.random.random(1)[0])*D #in case we don't have data for penetration length
             ep = np.array([x[ii][0]+Dir_cosines[ii][0]*l,x[ii][1]+Dir_cosines[ii][1]*l]) #end point of the ray for this iteration
 # end point it will be the firist point + l * direction
             
@@ -101,45 +112,43 @@ for i in range(Num): #number of iterations
             R_theta1 = np.random.random(1)[0]
             
             theta1 = pi*R_theta1# pi to make sure the sphere dose not intersect with ray twice
-## Rotation matrix to get the direction in the ground frame
-#            k2_ = np.array([(ep[0]-x[ii][0]),(ep[1]-x[ii][1])]) # final point - firist point
-#            norm1 =LA.norm(k2_)
-#            k2 = k2_/norm1
-#            norm2 = np.cross(k2,k1)
-#            i2 = (np.cross(k2,k1))/LA.norm(norm2)
-#            j2 = np.cross(k2,i2)
-#            rot = np.array([[i2],[j2],[k2]])#rotation matrix to get direction cosines in the ground frame
-#            rot = rot.transpose()
-##Direction cosines of the center of the sphere from the end point in grd frame
-#            dir_cos_sec = np.array([cos(theta1),sin(theta1)])
-#            Dir_cos_grd = np.matmul(rot,dir_cos_sec)
-##coordinates of the center of the spheres
+
             
             
-            # convert the direction of center of sphere to ground frame
-#            Dir_cos_grd=np.array([cos(theta1-(90*(pi/180)-theta)),sin(theta1-(90*(pi/180)-theta))])
             
+
+##coordinates of the center of the spheres  
             dir_cos_sec = np.array([cos(theta1),sin(theta1)])
             
+# convert the direction of center of sphere to ground frame 
             
+## Rotation matrix to get the direction in the ground frame
             
+##            [rotation matrix][secondary frame direction]=[direction in ground frame]
+
+##           [rotation matrix]=[cos (a) sin(a), [-sin(a)  cos(a)]] 
+## a is the angle of rotation
+## a is 90 - angle of vector (1) that the second vector rotated abour
+## the vector (1) is the y+ direction of the second vector
+## a should be releative to +x direction, so it should be from 0 to 360$
+             
             last_vector=np.array([Dir_cosines[ii]])
             
             theta_x_axis=atan(abs(last_vector[0][1])/abs(last_vector[0][0]))
                 
             if last_vector[0][1]>0 and last_vector[0][0]>0:
                 theta_last_vector=theta_x_axis
-            elif last_vector[0][1] and last_vector[0][0]<0:
-                theta_last_vector=180-theta_x_axis
+            elif last_vector[0][1]>0 and last_vector[0][0]<0:
+                theta_last_vector=pi-theta_x_axis
                     
-            elif last_vector[0][1] and last_vector[0][0]<0:
-                theta_last_vector=180+theta_x_axis
+            elif last_vector[0][1]<0 and last_vector[0][0]<0:
+                theta_last_vector=pi+theta_x_axis
             else:
-                theta_last_vector=360-theta_x_axis
+                theta_last_vector=2*pi-theta_x_axis
                     
            
             theta_of_vector=theta_last_vector
-            angle_rotation=(90*pi/180)-theta_of_vector    
+            angle_rotation=(pi/2)-theta_of_vector    
             rot=np.array([[cos(angle_rotation), sin(angle_rotation)],[-sin(angle_rotation), cos(angle_rotation)]])
             Dir_cos_grd=np.matmul(rot, dir_cos_sec)
             
@@ -159,7 +168,7 @@ for i in range(Num): #number of iterations
                 dis = (sphere_center_grd[0][0] - a[0])**2 + (sphere_center_grd[0][1] - a[1])**2       
                 dis_list.append(dis)
             for a in dis_list:
-                if a<((D**2)):
+                if a<(((D+gab)**2)):
                     B.append(1)
                 else:
                     B.append(0)
@@ -176,7 +185,7 @@ for i in range(Num): #number of iterations
             p11 = np.reshape(p11,(1,2))
             p22 = np.reshape(p22,(1,2))
             
-            for a in sphere_center[1:-2]:# -2 because I want to exculde the last sphere the sphere that I generate from this iteration
+            for a in sphere_center[1:-1]:# -2 because I want to exculde the last sphere the sphere that I generate from this iteration
                 a = np.array(a)
                 y = np.divide(p22 - p11, np.linalg.norm(p22 - p11))                
 #                n1_ = np.squeeze(np.asarray(p11-a))
@@ -199,6 +208,7 @@ for i in range(Num): #number of iterations
                 iii = iii+1
                 sphere_center = np.delete(sphere_center,ii,0)
                 if iii > 100:
+                    
                     x = np.delete(x,ii,0)
                     Dir_cosines = np.delete(Dir_cosines,ii,0)
                     sphere_center = np.delete(sphere_center,ii-1,0)
@@ -207,7 +217,9 @@ for i in range(Num): #number of iterations
                     continue
                 continue# if tje overlap go back to while loop and generate another cirlce being hit be the ray
             # if the spheres continue to overlap more than 100 tiems then go to for loop and emit a new ray
-
+            
+        
+        
 #code for checking whether to do reflection or refraction
             normal = np.array([ep[0]-sphere_center[ii][0],ep[1]-sphere_center[ii][1]])# point on the sphere - center to find the normal
             norm = LA.norm(normal)
@@ -217,7 +229,7 @@ for i in range(Num): #number of iterations
             
             
         
-            phi = acos(np.dot(-normal_dir_cos,Dir_cosines[ii]))# we multiply the normal by -
+            phi = acos(np.dot(-normal_dir_cos,Dir_cosines[ii]))# we multiply the normal by - to have the sharp angle
             phi2 = asin(nta_air*sin(phi)/nta)
             
             rho_parallel = (nta*cos(phi)-nta_air*cos(phi2))/(nta*cos(phi)+nta_air*cos(phi2))
@@ -233,13 +245,7 @@ for i in range(Num): #number of iterations
 
             iii = 0
             if rand1< rho_avg: # Diffuse reflection
-#                k3 = normal_dir_cos
-#                norm3 = np.cross(k3,k1)
-#                i3 = (np.cross(k3,k1))/LA.norm(norm2)
-#                j3 = np.cross(k3,i3)
-#                rot3 = np.array([[i2],[j2],[k2]])#rotation matrix to get direction cosines in the ground frame
-#                rot3 = rot.transpose()
-                
+
                  #getting the center of the sphere being hit
                 R_theta2 = np.random.random(1)[0]
                 theta2 =pi*R_theta2
@@ -253,17 +259,17 @@ for i in range(Num): #number of iterations
                 if normal_dir_cos[1]>0 and normal_dir_cos[0]>0:
                     theta_of_normal=theta_x_axis
                 elif normal_dir_cos[1]>0 and normal_dir_cos[0]<0:
-                    theta_of_normal=180-theta_x_axis
+                    theta_of_normal=pi-theta_x_axis
                 elif normal_dir_cos[1]<0 and normal_dir_cos[0]<0:
-                    theta_of_normal=180+theta_x_axis
+                    theta_of_normal=pi+theta_x_axis
                 else:
-                    theta_of_normal=360-theta_x_axis
+                    theta_of_normal=2*pi-theta_x_axis
                     
                 
                 
                 
                 theta_of_vector=theta_of_normal
-                angle_rotation=(90*pi/180)-theta_of_vector    
+                angle_rotation=(pi/2)-theta_of_vector    
                 rot=np.array([[cos(angle_rotation), sin(angle_rotation)],[-sin(angle_rotation), cos(angle_rotation)]])
                 reflected_dir_cos=np.matmul(rot, reflected_dir_cos1)
             
@@ -279,6 +285,8 @@ for i in range(Num): #number of iterations
                 x = np.vstack((x,ep))
                 ii = ii+1
                 I = I - I*eta # loss of intensity due to collision
+                all_point=np.vstack((all_point,ep))
+
             
             else: #refraction
                 n = nta_air/nta
@@ -296,6 +304,8 @@ for i in range(Num): #number of iterations
                 # find the final point after the ray has refracted and travelled through the sphere
                 p1 = ep
                 p2 = np.array([p1[0]+refracted_dir_cos[0]*1,p1[1]+refracted_dir_cos[1]*1])
+                
+                
                 u = (p2[0] - p1[0])**2+(p2[1] - p1[1])**2
                 v = -2*((p2[0] - p1[0])*(sphere_center[ii][0]-ep[0])) + -2*((p2[1] - p1[1])*(sphere_center[ii][1]-ep[1]))
                 w = (sphere_center[ii][0]-ep[0])**2+(sphere_center[ii][1]-ep[1])**2-(D/2)**2
@@ -320,19 +330,37 @@ for i in range(Num): #number of iterations
                 x = np.vstack((x,ep2))
                 Dir_cosines = np.vstack((Dir_cosines,refracted_dir_cos3))
                 ii = ii+1
-                I = I*rho_avg
-                
+                I = I - I*eta
+                all_point1=np.vstack((all_point,ep))
+                all_point=np.vstack((all_point1,ep2))
+
+
         elif ep[1]< 0:
             I = I
             E2.append(I)
+            all_point=np.vstack((all_point,ep))
             #print("end2")
             break
         else:
             E1.append(I)
+            all_point=np.vstack((all_point,ep))
             #print("end1")
             break
-print (sum(E1))
-print (sum(E2))       
+        
+print ('Transmitted', sum(E1))
+print ('reflected',sum(E2))
+
+#print ('fail', fail)
+#print ('sucess', sucess)
+
 stop = timeit.default_timer()
 
 print('Time: ', stop - start)
+
+
+with open('all_point.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(all_point)
+with open('sphere_center.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(sphere_center)

@@ -5,12 +5,6 @@ Created on Wed Jan 22 17:39:13 2020
 @author: hssharadga
 """
 
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Jan 21 20:27:44 2020
-
-@author: hssharadga
-"""
 ##Method 
 ## after we calcualte the penetration length, we start from the origin
 # we emit ray in random direction with length of penetration length (we emit ray from (0,0))
@@ -22,10 +16,10 @@ Created on Tue Jan 21 20:27:44 2020
 
 import numpy as np
 from numpy import linalg as LA
-from math import sqrt, asin,acos, pi, sin, cos, tan, exp
+from math import sqrt, asin,acos, pi, sin, cos, tan, exp,atan
 import random
 import timeit
-
+import csv
 start = timeit.default_timer()
 
 
@@ -46,18 +40,18 @@ penetration_len = data
 
 
 # inputs
-Num=1000 # number of iterations
+Num=1 # number of iterations
 D = 100 #sphere diameter(cm)
 eta = 0.4 #absorbtivity
-nta = 20000 #refractive index
+nta = 2000 #refractive index
 ex = 0.3 #extinction coefficient
 nta_air = 1.0003
 A = np.array([2438,2438/2]) #bed dimentions(cm)
-
+gab=10
 
 E1 = [] #save intencities that gets transmitted
 E2 = [] # saves intencities that are reflected
-
+fail=0
 for i in range(Num): #number of iterations
 #ground frame
     print ('Number of iterations = ',i)
@@ -88,6 +82,9 @@ for i in range(Num): #number of iterations
     ii = 1  
     iii= 0
     
+    
+    all_point=x[:]
+
     while I > 1E-10:
         overlap = False
 # skipping the first step when end point is already known       
@@ -105,22 +102,12 @@ for i in range(Num): #number of iterations
             R_theta1 = np.random.random(1)[0]
             
             theta1 = pi*R_theta1# pi to make sure the sphere dose not intersect with ray twice
+
+
 ## Rotation matrix to get the direction in the ground frame
-#            k2_ = np.array([(ep[0]-x[ii][0]),(ep[1]-x[ii][1])]) # final point - firist point
-#            norm1 =LA.norm(k2_)
-#            k2 = k2_/norm1
-#            norm2 = np.cross(k2,k1)
-#            i2 = (np.cross(k2,k1))/LA.norm(norm2)
-#            j2 = np.cross(k2,i2)
-#            rot = np.array([[i2],[j2],[k2]])#rotation matrix to get direction cosines in the ground frame
-#            rot = rot.transpose()
-##Direction cosines of the center of the sphere from the end point in grd frame
-#            dir_cos_sec = np.array([cos(theta1),sin(theta1)])
-#            Dir_cos_grd = np.matmul(rot,dir_cos_sec)
+
 ##coordinates of the center of the spheres
-            
-            
-            # convert the direction of center of sphere to ground frame
+        
            
             
             dir_cos_sec = np.array([cos(theta1),sin(theta1)])
@@ -133,17 +120,17 @@ for i in range(Num): #number of iterations
                 
             if last_vector[0][1]>0 and last_vector[0][0]>0:
                 theta_last_vector=theta_x_axis
-            elif last_vector[0][1] and last_vector[0][0]<0:
-                theta_last_vector=180-theta_x_axis
+            elif last_vector[0][1]>0 and last_vector[0][0]<0:
+                theta_last_vector=pi-theta_x_axis
                     
-            elif last_vector[0][1] and last_vector[0][0]<0:
-                theta_last_vector=180+theta_x_axis
+            elif last_vector[0][1]<0 and last_vector[0][0]<0:
+                theta_last_vector=pi+theta_x_axis
             else:
-                theta_last_vector=360-theta_x_axis
+                theta_last_vector=2*pi-theta_x_axis
                     
            
             theta_of_vector=theta_last_vector
-            angle_rotation=(90*pi/180)-theta_of_vector    
+            angle_rotation=(pi/2)-theta_of_vector    
             rot=np.array([[cos(angle_rotation), sin(angle_rotation)],[-sin(angle_rotation), cos(angle_rotation)]])
             Dir_cos_grd=np.matmul(rot, dir_cos_sec)
             
@@ -165,7 +152,7 @@ for i in range(Num): #number of iterations
                 dis = (sphere_center_grd[0][0] - a[0])**2 + (sphere_center_grd[0][1] - a[1])**2       
                 dis_list.append(dis)
             for a in dis_list:
-                if a<((D**2)):
+                if a<(((D+gab)**2)):
                     B.append(1)
                 else:
                     B.append(0)
@@ -182,7 +169,7 @@ for i in range(Num): #number of iterations
             p11 = np.reshape(p11,(1,2))
             p22 = np.reshape(p22,(1,2))
             
-            for a in sphere_center[1:-2]:# -2 because I want to exculde the last sphere the sphere that I generate from this iteration
+            for a in sphere_center[1:-1]:# -2 because I want to exculde the last sphere the sphere that I generate from this iteration
                 a = np.array(a)
                 y = np.divide(p22 - p11, np.linalg.norm(p22 - p11))                
 #                n1_ = np.squeeze(np.asarray(p11-a))
@@ -204,6 +191,7 @@ for i in range(Num): #number of iterations
                 iii = iii+1
                 sphere_center = np.delete(sphere_center,ii,0)
                 if iii > 100:
+                    fail=fail+1
                     x = np.delete(x,ii,0)
                     Dir_cosines = np.delete(Dir_cosines,ii,0)
                     sphere_center = np.delete(sphere_center,ii-1,0)
@@ -212,6 +200,7 @@ for i in range(Num): #number of iterations
                     continue
                 continue# if tje overlap go back to while loop and generate another cirlce being hit be the ray
             # if the spheres continue to overlap more than 100 tiems then go to for loop and emit a new ray
+            # thus the ray will get aborbed and we leave the the centers generated by this ray
 
 #code for checking whether to do reflection or refraction
             normal = np.array([ep[0]-sphere_center[ii][0],ep[1]-sphere_center[ii][1]])# point on the sphere - center to find the normal
@@ -252,6 +241,8 @@ for i in range(Num): #number of iterations
                 Dir_cosines = np.vstack((Dir_cosines,reflected_dir_cos))
                 ii = ii+1
                 I = I - I*eta # loss of intensity due to collision
+                
+                all_point=np.vstack((all_point,ep))
                
 
             else: #refraction
@@ -270,12 +261,14 @@ for i in range(Num): #number of iterations
                 # find the final point after the ray has refracted and travelled through the sphere
                 p1 = ep
                 p2 = np.array([p1[0]+refracted_dir_cos[0]*1,p1[1]+refracted_dir_cos[1]*1])
+                
                 u = (p2[0] - p1[0])**2+(p2[1] - p1[1])**2
                 v = -2*((p2[0] - p1[0])*(sphere_center[ii][0]-ep[0])) + -2*((p2[1] - p1[1])*(sphere_center[ii][1]-ep[1]))
                 w = (sphere_center[ii][0]-ep[0])**2+(sphere_center[ii][1]-ep[1])**2-(D/2)**2
                 t1 = (-v + sqrt(v**2-(4*u*w)))/(2*u)
                 # t1= -v+  + becasue I want to find the farthest point where the ray exit the sphere
                 ep2 = np.array([ep[0]+ t1*(p2[0] - p1[0]), ep[1]+ t1*(p2[1] - p1[1])])
+               
                 s = sqrt((ep2[0]-ep[0])**2 + (ep2[1]-ep[1])**2)
                 normal2 = np.array([ep2[0]-sphere_center[ii][0],ep2[1]-sphere_center[ii][1]])
                 norm2 = LA.norm(normal2)
@@ -294,19 +287,59 @@ for i in range(Num): #number of iterations
                 x = np.vstack((x,ep2))
                 Dir_cosines = np.vstack((Dir_cosines,refracted_dir_cos3))
                 ii = ii+1
-                I = I*rho_avg
+                I = I - I*eta
+                
+                all_point1=np.vstack((all_point,ep))
+                all_point=np.vstack((all_point1,ep2))
                 
         elif ep[1]< 0:
+            
+#            for a in sphere_center[1:-1]:
+#                                a = np.array(a)
+#                y = np.divide(p22 - p11, np.linalg.norm(p22 - p11))                
+##                n1_ = np.squeeze(np.asarray(p11-a))
+##                n1 = np.array([n1_[0] - a[0],n1_[1] - a[1]])
+#                
+#                n1 = np.squeeze(np.asarray(p11-a))
+#                n2 = np.squeeze(np.asarray(y))
+#                n3 = np.squeeze(np.asarray(a-p22))
+#                s = np.dot(n1, n2)
+#                t = np.dot(n3, n2)
+#                h = np.maximum.reduce([s, t, 0])
+#                c = np.cross(a - p11, y)
+#                w = LA.norm(c)
+#                Dis_center_to_line = sqrt(w**2 + h**2)
+#                if Dis_center_to_line < D/2:
+#                    overlap = contiue
+#                
+#        
+            
             I = I
             E2.append(I)
+            all_point=np.vstack((all_point,ep))
             #print("end2")
             break
+        
+        
         else:
             E1.append(I)
+            all_point=np.vstack((all_point,ep))
             #print("end1")
             break
-print (sum(E1))
-print (sum(E2))       
+print ('Transmitted', sum(E1))
+print ('reflected',sum(E2)) 
+
+      
 stop = timeit.default_timer()
 
 print('Time: ', stop - start)
+
+
+with open('all_point.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(all_point)
+with open('sphere_center.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(sphere_center)    
+
+
