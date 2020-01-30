@@ -23,7 +23,7 @@ import timeit
 import csv
 start = timeit.default_timer()
 
-
+mode=0
 
 
 
@@ -47,7 +47,7 @@ penetration_len = data
 Num=1 # number of iterations
 D = 100 #sphere diameter(cm)
 eta = 0.4 #absorbtivity
-nta = 2 #refractive index
+nta = 2000 #refractive index
 ex = 0.3 #extinction coefficient
 nta_air = 1.0003
 A = np.array([2438,2438/2]) #bed dimentions(cm)
@@ -67,9 +67,12 @@ for i in range(Num): #number of iterations
     o = np.array([0,0])# origin
 #List of the points being hit by this ray 
     x = np.array(o)
+    
+    l_list=np.array([0])
 #direction cosines of the ray
     ll = random.choice(penetration_len) #select a random penetration length from the data
     l=ll[0]
+    l_list=np.vstack((l_list,l))
     
     #l = (1+np.random.random(1)[0])*D
 
@@ -83,12 +86,15 @@ for i in range(Num): #number of iterations
     ip = np.array([dir_cos[0]*l,dir_cos[1]*l]) # first hit point (end point of ray, the firist point is (0,0))
     x = np.vstack((x,o)) #first point in x is redundant and is added just to make cade easier
     ep = ip # ep is the end point of each step
+    
     sphere_center=np.array([0,0]) 
+    sphere_all=sphere_center [:]
     I = 1 #Intensity or energy of the ray
     ii = 1  
     iii= 0
-    
+    fail=0
     all_point=x[:]
+    ind=np.array([0])
   
     while I > 1E-10:
     
@@ -101,6 +107,8 @@ for i in range(Num): #number of iterations
         if len(x)> 2:
             ll = random.choice(penetration_len)
             l=ll[0]
+            l_list=np.vstack((l_list,l))
+           
            #l = (0.5+np.random.random(1)[0])*D #in case we don't have data for penetration length
             ep = np.array([x[ii][0]+Dir_cosines[ii][0]*l,x[ii][1]+Dir_cosines[ii][1]*l]) #end point of the ray for this iteration
 # end point it will be the firist point + l * direction
@@ -159,7 +167,7 @@ for i in range(Num): #number of iterations
             sphere_center_grd = np.array([Dir_cos_grd[0]*D/2 + ep[0],Dir_cos_grd[1]*D/2 + ep[1]])     
             sphere_center_grd = np.reshape(sphere_center_grd, (1, 2))
             sphere_center = np.vstack((sphere_center,sphere_center_grd))# adding sphere being hit to the list to keep track of the spheres being added, later add this to the main list
-    
+            sphere_all=np.vstack((sphere_all,sphere_center_grd))
 #code for checking the overlap
             #Code for checking whether the new sphere is overlaping with an existing sphere 
             dis_list = []
@@ -210,8 +218,23 @@ for i in range(Num): #number of iterations
                 if iii > 100:
                     
                     x = np.delete(x,ii,0)
+                    print (all_point)
+                    
+                    tt=len(all_point)
+                    
+                    if mode==0:
+                        all_point=np.delete(all_point,tt-1,0)
+                    else:
+                        
+                        all_point=np.delete(all_point,(tt-1,tt-2),0)
+                      
+                    print (all_point)    
+        
                     Dir_cosines = np.delete(Dir_cosines,ii,0)
                     sphere_center = np.delete(sphere_center,ii-1,0)
+                    
+                    fail=fail+1
+                    ind=np.vstack((ind,ii))
                     ii = ii-1
                     iii = 0
                     continue
@@ -286,6 +309,8 @@ for i in range(Num): #number of iterations
                 ii = ii+1
                 I = I - I*eta # loss of intensity due to collision
                 all_point=np.vstack((all_point,ep))
+                mode=0
+                print ('mode',mode)
 
             
             else: #refraction
@@ -331,21 +356,75 @@ for i in range(Num): #number of iterations
                 Dir_cosines = np.vstack((Dir_cosines,refracted_dir_cos3))
                 ii = ii+1
                 I = I - I*eta
-                all_point1=np.vstack((all_point,ep))
-                all_point=np.vstack((all_point1,ep2))
+                all_point=np.vstack((all_point,ep))
+                all_point=np.vstack((all_point,ep2))
+                mode=1
+                print ('mode',mode)
 
 
         elif ep[1]< 0:
+    
+            # to make sure no colsion with any sphere if escape, transmitted, reflected
+            for a in sphere_center[1:-1]:
+                a = np.array(a)
+                y = np.divide(p22 - p11, np.linalg.norm(p22 - p11))                
+#                n1_ = np.squeeze(np.asarray(p11-a))
+#                n1 = np.array([n1_[0] - a[0],n1_[1] - a[1]])
+                
+                n1 = np.squeeze(np.asarray(p11-a))
+                n2 = np.squeeze(np.asarray(y))
+                n3 = np.squeeze(np.asarray(a-p22))
+                s = np.dot(n1, n2)
+                t = np.dot(n3, n2)
+                h = np.maximum.reduce([s, t, 0])
+                c = np.cross(a - p11, y)
+                w = LA.norm(c)
+                Dis_center_to_line = sqrt(w**2 + h**2)
+                if Dis_center_to_line < D/2:
+                    continue
+            
+            
             I = I
             E2.append(I)
             all_point=np.vstack((all_point,ep))
             #print("end2")
             break
+        
+        
+        
+        
+        
+        
+        
+        
         else:
+
+            # to make sure no colsion with any sphere if escape, transmitted, reflected
+            for a in sphere_center[1:-1]:
+                a = np.array(a)
+                y = np.divide(p22 - p11, np.linalg.norm(p22 - p11))                
+#                n1_ = np.squeeze(np.asarray(p11-a))
+#                n1 = np.array([n1_[0] - a[0],n1_[1] - a[1]])
+                
+                n1 = np.squeeze(np.asarray(p11-a))
+                n2 = np.squeeze(np.asarray(y))
+                n3 = np.squeeze(np.asarray(a-p22))
+                s = np.dot(n1, n2)
+                t = np.dot(n3, n2)
+                h = np.maximum.reduce([s, t, 0])
+                c = np.cross(a - p11, y)
+                w = LA.norm(c)
+                Dis_center_to_line = sqrt(w**2 + h**2)
+                if Dis_center_to_line < D/2:
+                    continue
+     
             E1.append(I)
             all_point=np.vstack((all_point,ep))
             #print("end1")
             break
+        
+        
+        
         
 print ('Transmitted', sum(E1))
 print ('reflected',sum(E2))
@@ -364,3 +443,10 @@ with open('all_point.csv', "w", newline = '') as output:
 with open('sphere_center.csv', "w", newline = '') as output:  
     writer = csv.writer(output, lineterminator='\n')
     writer.writerows(sphere_center)
+    
+with open('x.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(x)    
+    
+    
+print (fail)    
