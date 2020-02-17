@@ -4,6 +4,12 @@ Created on Fri Feb 14 22:24:27 2020
 
 @author: hssharadga
 """
+
+
+#Temperature and Wavelength-Dependent Spectral Absorptivities of Metallic Materials in the Infrared
+# https://arc.aiaa.org/doi/pdf/10.2514/1.15518
+
+
 from math import sqrt,pi
 import numpy as np
 from numpy import *
