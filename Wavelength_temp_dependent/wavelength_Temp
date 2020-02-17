@@ -1,0 +1,170 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Feb 14 22:24:27 2020
+
+@author: hssharadga
+"""
+from math import sqrt,pi
+import numpy as np
+from numpy import *
+import matplotlib.pyplot as plt
+
+
+# alumunium at 10.6 micro meter T=300
+
+#l=(10.6/1000000)
+#c=3E8
+#f=c/l
+#w=2*pi*f
+#
+#m=9.109E-31
+#sigma=3.66E7
+#sigma=1.63E7
+#N=1.249E29
+##N=1.907E29
+#
+#e=1.602E-19
+#epislon=8.8E-12
+#
+#
+#t=m*sigma/(N*(e**2))
+#
+#wp=(N*(e**2)/(m*epislon))**0.5
+#
+##wp=1.992E16
+##wp=1.992E16
+##t=1.04E-14
+#
+#q=wp**2/(w**2+(1/t)**(2))
+#
+#n=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)-q+1)**(0.5)
+#    
+#k=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)+q-1)**(0.5)
+#a=(1-(((n-1)**2+k**2)/(((n+1)**2+k**2))))
+
+
+
+
+
+
+
+
+
+# AISI 304 differernt wavelength
+# Temperature and Wavelength-Dependent Spectral Absorptivities of Metallic Materials in the Infrared
+N=1.613E29
+sigma=1.389E6
+
+m=9.109E-31
+
+e=1.602E-19
+epislon=8.8E-12 
+ 
+t=m*sigma/(N*(e**2))
+wp=(N*(e**2)/(m*epislon))**0.5
+a=[]
+lambda00=[]
+for i in range (24):
+    
+
+    if i==0:
+        l=0.1/1000000
+        lambda00.append(l)
+    if i>0:
+        l=(0.5*(i)/1000000)
+        lambda00.append(l)
+     
+        
+        
+
+    C=3*1000*1000*100
+    f=C/l
+    w=2*pi*f
+    
+    #wp=2.266
+    
+    #wp=1.992E16
+    #wp=1.992E16
+    #t=1.04E-14
+    
+    q=wp**2/(w**2+(1/t)**(2))
+    
+    n=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)-q+1)**(0.5)
+    
+    k=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)+q-1)**(0.5)
+    
+    
+    a.append(1-(((n-1)**2+k**2)/(((n+1)**2+k**2))))
+
+plt.plot(lambda00,a, label="D")  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#
+## AISI 304  differernt temperture
+### Temperature and Wavelength-Dependent Spectral Absorptivities of Metallic Materials in the Infrared
+#N=1.613E29
+#sigma=1.389E6
+#
+#m=9.109E-31
+#
+#e=1.602E-19
+#epislon=8.8E-12 
+# 
+#
+#wp=(N*(e**2)/(m*epislon))**0.5
+#a=[]
+#sigma=np.array([1.389,1.289,1.176,1.025,0.933,0.876,0.836])
+#T=np.array([298,373,473,673,873,1073,1273])
+#
+#for i in range (7):
+#    
+#    sigma1=sigma[i]*1E6
+#    t=m*sigma1/(N*(e**2))
+#    
+#
+#
+#     
+#        
+#    l=10.6E-6    
+#
+#    C=3*1000*1000*100
+#    f=C/l
+#    w=2*pi*f
+#    
+#    #wp=2.266
+#    
+#    #wp=1.992E16
+#    #wp=1.992E16
+#    #t=1.04E-14
+#    
+#    q=wp**2/(w**2+(1/t)**(2))
+#    
+#    n=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)-q+1)**(0.5)
+#    
+#    k=(1/sqrt(2))*((((1-q)**2+((q/(w*t))**2))**0.5)+q-1)**(0.5)
+#    
+#    
+#    a.append(1-(((n-1)**2+k**2)/(((n+1)**2+k**2))))
+#
+#plt.plot(T,a, label="D") 
+##plt.xlim((1,15))
+#plt.ylim((0.05,0.12))  
