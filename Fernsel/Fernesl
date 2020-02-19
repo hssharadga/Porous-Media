@@ -1,0 +1,77 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Feb 18 23:42:21 2020
+
+@author: hssharadga
+"""
+# fernsel equation
+
+import matplotlib.pyplot as plt
+from math import pi, sin, tan, asin, atan,cos,sqrt
+
+
+R=[]
+Rs1=[]
+Rp1=[]
+
+th=[]# incident angel
+th2=[]# refraction angel
+phi2=[]# refraction angel speical case
+
+rho_avg=[]# for the special case
+rho_perpendicular=[]
+rho_parallel=[]
+
+
+nta2=2.6679 #AL
+kta2=8.0941
+
+nta1=1.329  # water
+kta1=1.891E-7
+
+for i in range (90):
+    thetadeg=i+1
+    theta = thetadeg*pi/180;
+    th.append (thetadeg)
+    
+
+    phi=theta
+    p = sqrt(1/2*(sqrt((nta2**2-kta2**2-nta1**2*sin(phi)**2)**2+4*nta2**2*kta2**2)+(nta2**2-kta2**2-nta1**2*sin(phi)**2)))
+    q = sqrt(1/2*(sqrt((nta2**2-kta2**2-nta1**2*sin(phi)**2)**2+4*nta2**2*kta2**2)-(nta2**2-kta2**2-nta1**2*sin(phi)**2)))
+    Rs = ((nta1*cos(phi)-p)**2+q**2)/((nta1*cos(phi)+p)**2+q**2)
+    Rp = ((p-nta1*sin(phi)*tan(phi))**2+q**2)/((p+nta1*sin(phi)*tan(phi))**2+q**2)*Rs
+    R.append( (Rs+Rp)/2)
+    Rs1.append(Rs)
+    Rp1.append(Rp)
+    theta2=atan(nta1*sin(theta)/p)
+    th2.append(theta2*180/pi)
+    
+    phi22=180/pi* asin(nta1*sin(phi)/nta2)# speical case
+    phi2.append(phi22)
+    phi22=asin(nta1*sin(phi)/nta2)
+    rho_parallel1 =(cos(phi22)-(nta2/nta1)*cos(phi))/(cos(phi22)+(nta2/nta1)*cos(phi))
+    rho_perpendicular1 =(cos(phi)-(nta2/nta1)*cos(phi22)) /(cos(phi)+(nta2/nta1)*cos(phi22))
+    rho_parallel.append(rho_parallel1)
+    rho_perpendicular.append(rho_perpendicular1)
+    rho_avg.append( (rho_parallel1**2 + rho_perpendicular1**2)/2)
+    
+    
+plt.xlabel('Angle of incidence theta')
+plt.ylabel('Reflectivity')
+    
+plt.plot(th,R,label="R")    
+plt.plot(th,Rs1,label="Rs")    
+plt.plot(th,Rp1,label="Rp")    
+plt.legend()
+
+plt.show()
+
+plt.plot(th,th2,label="final") 
+plt.plot(th,phi2,label="spical")
+plt.legend() 
+plt.show()
+
+plt.plot(th,rho_avg,label="R")
+plt.plot(th,rho_parallel,label="rho_parallel")
+plt.plot(th,rho_perpendicular,label="rho_perpendicular")
+plt.legend()
