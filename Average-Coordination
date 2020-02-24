@@ -1,0 +1,56 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Feb 24 16:05:20 2020
+
+@author: hssharadga
+"""
+
+# average coordination number
+
+import numpy as np
+from numpy import linalg as LA
+from math import sqrt
+
+import csv 
+
+import timeit
+
+start = timeit.default_timer()
+D=100
+coordi=0
+coordi_matrix=[]
+########### import
+#Code to import the circels centers  from the results previous code (2D packing),  a csv file
+# =============================================================================
+f = open('Circels.csv','r')# Circels is the name of the file
+reader = csv.reader(f)
+data = []
+for row in reader:
+    data.append(row)
+data = np.array(data,float)
+# =============================================================================
+xx1 = data.tolist()
+i=-1
+for a in xx1:
+    i=i+1
+    sphere1=np.array([a[0],a[1]])
+    coordi=0
+    all_sphere=xx1[:]
+    del all_sphere[i]
+    print (i)
+    for j in all_sphere:
+        dis=sqrt((sphere1[0]-j[0])**2+(sphere1[1]-j[1])**2)
+        if dis<1.5*D:
+            coordi=coordi+1
+#    print (coordi)
+    coordi_matrix.append(coordi)
+    
+    
+coordi_mean=np.average(coordi_matrix)
+print(coordi_mean)
+
+stop = timeit.default_timer()
+
+print('Time: ', stop - start)         
+ 
+
