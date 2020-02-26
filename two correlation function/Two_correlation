@@ -1,0 +1,78 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Feb 25 15:12:02 2020
+
+@author: hssharadga
+"""
+
+## two correlation function
+import numpy as np
+from numpy import linalg as LA
+from math import sqrt
+
+import csv 
+
+import timeit
+
+start = timeit.default_timer()
+D=100
+cor=0
+cor_matrix=[]
+########### import
+#Code to import the circels centers  from the results previous code (2D packing),  a csv file
+# =============================================================================
+f = open('Circels.csv','r')# Circels is the name of the file
+reader = csv.reader(f)
+data = []
+for row in reader:
+    data.append(row)
+data = np.array(data,float)
+# =============================================================================
+xx1 = data.tolist()
+i=-1
+
+
+Radius = 50
+W=2482
+H=W/2
+S=2*Radius
+S=int(1*Radius)
+
+sum=0
+HH=H-S
+for i in range(0,int(HH),S):
+    for j in range (0,W,S):
+        p1=np.array([j,i])
+        p2=np.array([j,i+S])
+        sum=0
+
+        for a in xx1:
+            dis1=sqrt((p1[0]-a[0])**2+(p1[1]-a[1])**2)
+            
+            if dis1<D/2:
+                sum=sum+1
+            
+        for a1 in xx1:
+            dis2=sqrt((p2[0]-a1[0])**2+(p2[1]-a1[1])**2)
+            if dis2<D/2:
+                sum=sum+1 
+
+        if sum==2:
+            cor_matrix.append(1)
+           
+        else:
+            cor_matrix.append(0)
+                
+                
+                
+
+    
+    
+cor_mean=np.average(cor_matrix)
+print(cor_mean*100)
+
+stop = timeit.default_timer()
+
+print('Time: ', stop - start)         
+ 
+
