@@ -1,0 +1,213 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Feb 27 13:10:37 2020
+
+@author: hssharadga
+"""
+
+import timeit
+
+start = timeit.default_timer()
+
+
+###################### Advanced Packing
+# inputs
+############################
+maxIterations = 3*1E3
+W=2483*4 
+H=2483/2  
+densityDesired = 0.3
+Radius = 50
+D=2*Radius
+minGap= 0## gab between circle
+borderGap = 0 ## gab between border and the nearest circle
+################################################
+
+import numpy as np
+from math import sqrt, pi
+from numpy import linalg as LA
+import csv 
+
+area = W*H;
+# Add a Border Around Default Panel Size
+xMin = borderGap
+xMax = W-borderGap
+yMin = borderGap
+yMax = H-borderGap
+areaBorder = (xMax-xMin)*(yMax-yMin)
+densityBorder = 0
+
+
+# inital circcle
+x=np.random.randint (xMin+Radius,xMax-Radius)
+y=np.random.randint (yMin+Radius, yMax-Radius)
+r=Radius
+Center=np.array ([[x,y]])
+
+
+combinedRadius = 2*r
+b=0
+
+
+
+iterations = 0;
+
+# Begin Adding Circles and Detect Overlaps
+
+
+while densityBorder < densityDesired:
+
+# Generate a New Circle
+
+    xNew_=np.random.randint (xMin+Radius,xMax-Radius)
+    yNew_=np.random.randint (yMin+Radius, yMax-Radius)
+    New_Center= np.array ([xNew_,yNew_])
+
+
+    iterations=iterations+1;
+    print ('iterations = ',iterations)
+    if iterations > maxIterations:
+        print ('maxIterations reached')
+        break
+    
+#Test if Circle Overlaps any Pre-Existing Circle with a Gap
+    for a in Center:
+        a=np.array(a)
+        disBetweenCircles= sqrt((New_Center[0]-a[0])**2+(New_Center[1]-a[1])**2)
+        
+        if disBetweenCircles-combinedRadius<=minGap:
+            b=b+1
+    if b==0:
+         Center=np.vstack ((Center,New_Center))
+    else:
+         b=0
+         continue
+            
+
+    areaCovered=(len(Center))*pi*r**2;
+    density = areaCovered/area;
+    densityBorder = areaCovered/areaBorder;
+
+    if densityBorder >= densityDesired:
+        print ('finish') 
+        Center_new=Center.copy()
+        break
+        
+
+    
+
+###################### compression
+
+if densityBorder < densityDesired:
+    print ('compression stage')
+
+    index=-1    
+    short_dis=2000      
+    Center_new=Center.copy()
+
+
+    l=len(Center_new)
+
+
+    for j in range(l):# compress all sphere
+        stage=2
+#for i in range(10):# compress all sphere
+#    index=index+1
+#    print (j)
+        short_dis=2000  
+    
+        sphere=np.array([Center_new[j,0],Center_new[j,1]])
+#    print (sphere)
+        Center_last=Center_new.copy()
+   
+        Center_last=np.delete(Center_last ,j,0)
+#    index1=-1
+        for j1 in Center_last:
+#        index1=index1+1
+            sphere2=np.array([j1[0],j1[1]])
+            dis=sqrt((sphere[0]-sphere2[0])**2+(sphere[1]-sphere2[1])**2)
+#            print ('dis',dis)
+            if dis<short_dis:    
+                short_dis=dis
+#            print ('short_dis = ',short_dis)
+#            index1_last=index1
+                closet_sphere=np.array([sphere2[0],sphere2[1]])
+                vector=np.array([(closet_sphere[0]-sphere[0]),(closet_sphere[1]-sphere[1])])
+                norm = LA.norm(vector)
+#                print ('norm = ',norm)
+#    print (sphere)
+#    print (closet_sphere)
+        vector_cos= np.array([vector[0]/norm, vector[1]/norm])
+        vector_corrected=np.array([vector_cos[0]*(short_dis-D), vector_cos[1]*(short_dis-D)])
+        new_sphere=np.array([sphere[0]+vector_corrected[0],sphere[1]+vector_corrected[1]])
+#    print (new_sphere)
+        Center_new[j,0]=new_sphere[0]
+        Center_new[j,1]=new_sphere[1]
+  
+    
+# another trial    
+################################################################################################################
+maxIterations = 5E3
+
+
+iterations = 0;
+
+# Begin Adding Circles and Detect Overlaps
+if densityBorder < densityDesired:  
+    print ('another trial')   
+   
+while densityBorder < densityDesired:
+    
+
+# Generate a New Circle
+
+    xNew_=np.random.randint (xMin+Radius,xMax-Radius)
+    yNew_=np.random.randint (yMin+Radius, yMax-Radius)
+    New_Center= np.array ([xNew_,yNew_])
+
+
+    iterations=iterations+1;
+    print ('iterations = ',iterations)
+    if iterations > maxIterations:
+        print ('maxIterations reached')
+        break
+    
+#Test if Circle Overlaps any Pre-Existing Circle with a Gap
+    for a in Center_new:
+        a=np.array(a)
+        disBetweenCircles= sqrt((New_Center[0]-a[0])**2+(New_Center[1]-a[1])**2)
+        
+        if disBetweenCircles-combinedRadius<=minGap:
+            b=b+1
+    if b==0:
+         Center_new=np.vstack ((Center_new,New_Center))
+    else:
+         b=0
+         continue
+            
+
+    areaCovered=(len(Center_new))*pi*r**2;
+    density = areaCovered/area;
+    densityBorder = areaCovered/areaBorder;
+
+    if densityBorder >= densityDesired:
+        print ('finish')    
+        break
+        
+##################################################################################3
+print ('densityBorder:',densityBorder * 100)
+print ('number of sphere: ',len(Center_new))
+print ('number of iteration :',iterations)
+
+
+#Saving the results in a file
+with open('Circels.csv', "w", newline = '') as output: ## Circles is the name of excel file that will be produced
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(Center_new) ## Center is waht I want the python to write out
+
+with open('Center_old.csv', "w", newline = '') as output: ## Circles is the name of excel file that will be produced
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(Center) ## Center is waht I want the python to write out
+stop = timeit.default_timer()
+
+print('Time: ', stop - start)    
