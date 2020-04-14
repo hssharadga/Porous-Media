@@ -1,0 +1,281 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr 11 02:00:33 2020
+
+@author: hssharadga
+"""
+
+import numpy as np
+import csv
+
+f = open('all_data.csv','r')# Circels is the name of the file
+reader = csv.reader(f)
+data = []
+for row in reader:
+    data.append(row)
+data = np.array(data,float)
+
+
+all_output=[]
+all_input=[]
+for i in range (24000):
+
+    input0=np.array(data[i][0:12])
+#    np.reshape(input0,(12,0))
+           
+    output1=np.array(data[i][12:15])           
+#    np.reshape(output,(3,0))
+    if i==0:
+        all_input=np.array([np.transpose(input0)])
+        all_output=np.array([np.transpose(output1)])
+    if i>0:
+        all_input=np.vstack((all_input,np.transpose(input0)))             
+        all_output=np.vstack((all_output,np.transpose(output1)))
+        all_input=all_input
+        all_output=all_output
+
+#all_input=StandardScaler().fit_transform(all_input)
+#all_output=StandardScaler().fit_transform(all_output.reshape(len(all_output),1))[:,0] 
+
+#all_output=(all_output.reshape(len(all_output),1))[:,0]
+       
+#from sklearn.datasets import make_moons
+#from matplotlib import pyplot
+#from pandas import DataFrame
+#
+#import keras.models
+#from keras.models import Sequential
+#from keras import Sequential
+#from keras.layers import Activation, Dense
+
+
+## generate two moons dataset
+#from sklearn.datasets import make_moons
+#from matplotlib import pyplot
+#from pandas import DataFrame
+## generate 2d classification dataset
+#X, y = make_moons(n_samples=100, noise=0.2, random_state=1)
+## scatter plot, dots colored by class value
+#df = DataFrame(dict(x=X[:,0], y=X[:,1], label=y))
+#colors = {0:'red', 1:'blue'}
+#fig, ax = pyplot.subplots()
+#grouped = df.groupby('label')
+#for key, group in grouped:
+#    group.plot(ax=ax, kind='scatter', x='x', y='y', label=key, color=colors[key])
+#pyplot.show()
+#
+
+## mlp overfit on the moons dataset
+#from sklearn.datasets import make_moons
+#from keras.layers import Dense
+#from keras.models import Sequential
+#from matplotlib import pyplot
+## generate 2d classification dataset
+#X, y = make_moons(n_samples=100, noise=0.2, random_state=1)
+## split into train and test
+#n_train = 30
+#trainX, testX = X[:n_train, :], X[n_train:, :]
+#trainy, testy = y[:n_train], y[n_train:]
+## define model
+#model = Sequential()
+#model.add(Dense(500, input_dim=2, activation='relu'))
+#model.add(Dense(1, activation='sigmoid'))
+#model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+## fit model
+#history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=4000, verbose=0)
+## evaluate the model
+#_, train_acc = model.evaluate(trainX, trainy, verbose=0)
+#_, test_acc = model.evaluate(testX, testy, verbose=0)
+#print('Train: %.3f, Test: %.3f' % (train_acc, test_acc))
+## plot training history
+#pyplot.plot(history.history['loss'], label='train')
+#pyplot.plot(history.history['val_loss'], label='test')
+#pyplot.legend()
+#pyplot.show()
+#print('Train: %.3f, Test: %.3f' % (train_acc, test_acc))
+
+
+
+## with early stopping
+## mlp overfit on the moons dataset with simple early stopping
+#from sklearn.datasets import make_moons
+#from keras.models import Sequential
+#from keras.layers import Dense
+#from keras.callbacks import EarlyStopping
+#from matplotlib import pyplot
+## generate 2d classification dataset
+#X, y = make_moons(n_samples=100, noise=0.2, random_state=1)
+## split into train and test
+#n_train = 30
+#trainX, testX = X[:n_train, :], X[n_train:, :]
+#trainy, testy = y[:n_train], y[n_train:]
+#n_train = 20000
+#trainX, testX = all_input[:n_train, :], all_input[n_train:, :]
+#trainy, testy = all_output[:n_train], all_output[n_train:]
+### define model
+#model = Sequential()
+#model.add(Dense(10, input_dim=12, activation='relu'))
+#model.add(Dense(10, activation='sigmoid'))
+#
+#model.add(Dense(3, activation='sigmoid'))
+#model.compile(loss='MSE', optimizer='adam', metrics=['accuracy'])
+## simple early stopping
+#es = EarlyStopping(monitor='val_loss', mode='min', verbose=1)
+## fit model
+#history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=500, verbose=0, callbacks=[es])
+## evaluate the model
+#_, train_acc = model.evaluate(trainX, trainy, verbose=0)
+#_, test_acc = model.evaluate(testX, testy, verbose=0)
+#print('Train: %.3f, Test: %.3f' % (train_acc, test_acc))
+## plot training history
+#pyplot.plot(history.history['loss'], label='train')
+#pyplot.plot(history.history['val_loss'], label='test')
+#pyplot.legend()
+#pyplot.show()
+
+import timeit
+
+start = timeit.default_timer()
+
+N=100
+patience0
+early_stopping='yes'
+# with pateince
+# mlp overfit on the moons dataset with patient early stopping
+from sklearn.datasets import make_regression
+#from keras.models import Sequential
+from keras import models
+from keras import layers
+from keras.callbacks import EarlyStopping
+from matplotlib import pyplot
+from keras import optimizers
+
+
+from keras.callbacks import EarlyStopping
+from keras.callbacks import ModelCheckpoint
+
+from keras.models import load_model
+
+
+from sklearn.preprocessing import StandardScaler
+# generate 2d classification dataset
+#X, y = make_regression(n_samples=1000, n_features=20, noise=0.1, random_state=1)
+#
+#
+#
+#X=StandardScaler().fit_transform(X)
+#y=StandardScaler().fit_transform(y.reshape(len(y),1))[:,0]
+
+# split into train and test
+#n_train = 500
+#trainX, testX = X[:n_train, :], X[n_train:, :]
+#trainy, testy = y[:n_train], y[n_train:]
+
+n_train = 19199
+#all_output_new=all_output.reshape(24000)
+trainX, testX = all_input[:n_train, :], all_input[n_train:, :]
+trainy, testy = all_output[:n_train], all_output[n_train:]
+# define model
+model=models.Sequential()
+model.add(layers.Dense(30, input_dim=12, activation='relu', kernel_initializer='normal'))
+#model.add(layers.PReLU())
+#model.add(layers.Dense(20, input_dim=12, kernel_initializer='normal'))
+#model.add(layers.MaxoutDense(20, input_dim=12)) 
+#model.add(layers.MaxoutDense(20)) 
+model.add(layers.Dense (20,  kernel_initializer='normal'))
+#model.add(layers.PReLU())
+#model.add(layers.PReLU())
+#model.add(layers.Dense(10,  kernel_initializer='normal', activation='relu'))
+
+
+model.add(layers.Dense(3, kernel_initializer='normal'))
+
+    
+#model.add(layers.Dense(units=10, activation='relu', input_shape=(12,))
+#model.add(layers.Dense(units=12, activation='relu'))
+#model.add(layers.Dense(3, activation='sigmoid'))
+#opt = optimizers.adam(lr=1e-3, decay=1e-3 / 200) 
+#opt=SGD(lr=0.05, momentum=2)
+model.compile(loss='mean_squared_error', optimizer='Adam')
+
+#sgd = optimizers.SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
+#model.compile(loss='mean_squared_error', optimizer=sgd)
+
+# patient early stopping
+#es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=10)
+# fit model
+if early_stopping=='yes':
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=2, patience=patience0)
+    mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=2, save_best_only=True)
+    # fit model
+    history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=N, verbose=0, callbacks=[es, mc])
+    # load the saved model
+    saved_model = load_model('best_model.h5')
+    # evaluate the model
+    mse1 = saved_model.evaluate(trainX, trainy, verbose=0)
+    mse2 = saved_model.evaluate(testX, testy, verbose=0)
+    print('Train: %.3f, Test: %.3f' % (mse1, mse2))
+else:
+
+    history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=N, verbose=0)
+# evaluate the model
+    train_mse = model.evaluate(trainX, trainy, verbose=0)
+    test_mse = model.evaluate(testX, testy, verbose=0)
+    print('Train: %.3f, Test: %.3f' % (train_mse, test_mse))
+# plot training history
+pyplot.plot(history.history['loss'], label='train')
+pyplot.plot(history.history['val_loss'], label='test')
+pyplot.legend()
+pyplot.show()
+
+#yy=np.array(testX[0][:])
+pred=model.predict(testX)
+
+pred1=model.predict(trainX)
+
+with open('pred.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(pred)
+    
+    
+stop = timeit.default_timer()
+
+print('Time: ', stop - start)     
+## mlp overfit on the moons dataset with patient early stopping and model checkpointing
+#from sklearn.datasets import make_moons
+#from keras.models import Sequential
+#from keras.layers import Dense
+#from keras.callbacks import EarlyStopping
+#from keras.callbacks import ModelCheckpoint
+#from matplotlib import pyplot
+#from keras.models import load_model
+## generate 2d classification dataset
+#X, y = make_moons(n_samples=100, noise=0.2, random_state=1)
+## split into train and test
+##n_train = 30
+##trainX, testX = X[:n_train, :], X[n_train:, :]
+##trainy, testy = y[:n_train], y[n_train:]
+#n_train = 20000
+#trainX, testX = all_input[:n_train, :], all_input[n_train:, :]
+#trainy, testy = all_output[:n_train], all_output[n_train:]
+#
+#
+#
+## define model
+#
+#model = Sequential()
+#model.add(Dense(500, input_dim=12, activation='relu'))
+#model.add(Dense(3, activation='sigmoid'))
+#model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
+## simple early stopping
+#es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=200)
+#mc = ModelCheckpoint('best_model.h5', monitor='val_accuracy', mode='max', verbose=1, save_best_only=True)
+## fit model
+#history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=4000, verbose=0, callbacks=[es, mc])
+## load the saved model
+#saved_model = load_model('best_model.h5')
+## evaluate the model
+#_, train_acc = saved_model.evaluate(trainX, trainy, verbose=0)
+#_, test_acc = saved_model.evaluate(testX, testy, verbose=0)
+#print('Train: %.3f, Test: %.3f' % (train_acc, test_acc))
+
