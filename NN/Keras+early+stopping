@@ -138,7 +138,7 @@ import timeit
 start = timeit.default_timer()
 
 N=100
-patience0
+patience0=5
 early_stopping='yes'
 # with pateince
 # mlp overfit on the moons dataset with patient early stopping
