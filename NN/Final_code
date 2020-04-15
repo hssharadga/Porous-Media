@@ -1,0 +1,323 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr 11 02:00:33 2020
+
+@author: hssharadga
+"""
+
+import numpy as np
+import csv
+
+D=2
+dis='yes'
+
+if D==1:
+    f = open('all_data_1.csv','r')# Circels is the name of the file
+    reader = csv.reader(f)
+    data = []
+    for row in reader:
+        data.append(row)
+    data = np.array(data,float)
+    
+    a=15# 12 for D2 and 15 for D1
+    
+else:
+    
+    f = open('all_data_2.csv','r')# Circels is the name of the file
+    reader = csv.reader(f)
+    data = []
+    for row in reader:
+        data.append(row)
+    data = np.array(data,float)
+    
+    a=12# 12 for D2 and 15 for D1
+
+
+if dis=='yes':
+    
+    index=a-3
+else:
+    index=a-3-4# 3 the output  4 the distrubtion calcuations
+    
+    
+    
+#normilizing data
+
+m=[]
+St=[]
+data0=np.copy(data)
+
+for i in range (a):
+    g=np.mean(np.array(data0[:,i]))
+    gg=np.std(np.array(data[:,i]))
+    m.append(g)
+    St.append(gg)
+    
+    for j in range (24000):
+        data0[j][i]=(data[j][i]-m[i])/St[i]
+
+##############################################################################
+all_input=data0[:,0:index]
+all_output=data0[:,a-3:a]
+
+# without normilzing
+#all_input11=data[:,0:12]
+#all_output=data[:,12:15]
+
+import timeit
+start = timeit.default_timer()
+
+N=200
+patience0=40
+early_stopping='yes'
+# with pateince
+# mlp overfit on the moons dataset with patient early stopping
+from sklearn.datasets import make_regression
+from math import sqrt
+#from keras.models import Sequential
+from keras import models
+from keras import layers
+from keras.callbacks import EarlyStopping
+from matplotlib import pyplot
+import matplotlib
+from keras import optimizers
+from keras.callbacks import EarlyStopping
+from keras.callbacks import ModelCheckpoint
+from keras.models import load_model
+from sklearn.preprocessing import StandardScaler
+# generate 2d classification dataset
+#X, y = make_regression(n_samples=1000, n_features=20, noise=0.1, random_state=1)
+#
+#
+#
+#X=StandardScaler().fit_transform(X)
+#y=StandardScaler().fit_transform(y.reshape(len(y),1))[:,0]
+
+# split into train and test
+#n_train = 500
+#trainX, testX = X[:n_train, :], X[n_train:, :]
+#trainy, testy = y[:n_train], y[n_train:]
+
+n_train = int(4/5*3/4*24000)
+n_val=int(4/5*24000)
+#all_output_new=all_output.reshape(24000)
+trainX, valX ,testX = all_input[:n_train, :],all_input[n_train:n_val, :], all_input[n_val:, :]
+trainy,valy, testy = all_output[:n_train, :],all_output[n_train:n_val, :], all_output[n_val:, :]
+
+# define model
+model=models.Sequential()
+model.add(layers.Dense(30, input_dim=index, activation='relu', kernel_initializer='normal'))
+#model.add(layers.PReLU())
+#model.add(layers.Dense(20, input_dim=12, kernel_initializer='normal'))
+#model.add(layers.MaxoutDense(20, input_dim=12)) 
+#model.add(layers.MaxoutDense(20)) 
+model.add(layers.Dense (20,  kernel_initializer='normal'))
+#model.add(layers.PReLU())
+#model.add(layers.PReLU())
+#model.add(layers.Dense(10,  kernel_initializer='normal', activation='relu'))
+model.add(layers.Dense(3, kernel_initializer='normal'))
+#model.add(layers.Dense(units=10, activation='relu', input_shape=(12,))
+#model.add(layers.Dense(units=12, activation='relu'))
+#model.add(layers.Dense(3, activation='sigmoid'))
+#opt = optimizers.adam(lr=1e-3, decay=1e-3 / 200) 
+#opt=SGD(lr=0.05, momentum=2)
+model.compile(loss='mean_squared_error', optimizer='Adam')
+
+#sgd = optimizers.SGD(lr=0.01, decay=1e-6, momentum=0.9, nesterov=True)
+#model.compile(loss='mean_squared_error', optimizer=sgd)
+
+# patient early stopping
+#es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=10)
+# fit model
+if early_stopping=='yes':
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=2, patience=patience0)
+    mc = ModelCheckpoint('best_model.h5', monitor='val_loss', mode='min', verbose=2, save_best_only=True)
+    # fit model
+    history = model.fit(trainX, trainy, validation_data=(valX, valy), epochs=N, verbose=0, callbacks=[es, mc])
+    # load the saved model
+    saved_model = load_model('best_model.h5')
+    # evaluate the model
+    mse1 = saved_model.evaluate(trainX, trainy, verbose=0)
+    mse2 = saved_model.evaluate(valX, valy, verbose=0)
+    print('Train: %.3f, Test: %.3f' % (mse1, mse2))
+else:
+    history = model.fit(trainX, trainy, validation_data=(testX, testy), epochs=N, verbose=0)
+# evaluate the model
+    train_mse = model.evaluate(trainX, trainy, verbose=0)
+    test_mse = model.evaluate(testX, testy, verbose=0)
+    print('Train: %.3f, Test: %.3f' % (train_mse, test_mse))
+# plot training history
+#pyplot.plot(history.history['loss'], label='train')
+
+##  in log scale
+#pyplot.plot(np.log10(np.array(1+(np.array(history.history['loss'])))), label='train')
+#
+#pyplot.plot(np.log10(np.array(1+(np.array(history.history['val_loss'])))), label='test')
+
+pyplot.plot(history.history['loss'], label='train')
+pyplot.plot(history.history['val_loss'], label='test')
+
+#x1=np.array(np.log10(np.array(1+(np.array(history.history['loss'])))))
+#x2=(np.log10(np.array(1+(np.array(history.history['val_loss'])))))
+#pyplot.plot(x1[40:], label='train')
+#pyplot.plot(x2[40:], label='test')
+
+#pyplot.plot(history.history['val_loss'], label='test')
+pyplot.legend()
+pyplot.show()
+
+#yy=np.array(testX[0][:])
+pred=saved_model.predict(testX)
+val_pred=saved_model.predict(valX)
+#pred1=model.predict(trainX)
+
+# denormilizing
+for i in range (24000-n_val):
+   pred[i][0]=pred[i][0]*St[a-3]+m[a-3]
+   pred[i][1]=pred[i][1]*St[a-2]+m[a-2]
+   pred[i][2]=pred[i][2]*St[a-1]+m[a-1]
+
+   testy[i][0]=testy[i][0]*St[a-3]+m[a-3]
+   testy[i][1]=testy[i][1]*St[a-2]+m[a-2]
+   testy[i][2]=testy[i][2]*St[a-1]+m[a-1] 
+# validation
+   val_pred[i][0]=val_pred[i][0]*St[a-3]+m[a-3]
+   val_pred[i][1]=val_pred[i][1]*St[a-2]+m[a-2]
+   val_pred[i][2]=val_pred[i][2]*St[a-1]+m[a-1]
+
+   valy[i][0]=valy[i][0]*St[a-3]+m[a-3]
+   valy[i][1]=valy[i][1]*St[a-2]+m[a-2]
+   valy[i][2]=valy[i][2]*St[a-1]+m[a-1] 
+
+with open('pred.csv', "w", newline = '') as output:  
+    writer = csv.writer(output, lineterminator='\n')
+    writer.writerows(pred)
+    
+    
+stop = timeit.default_timer()
+print('Time: ', stop - start)     
+
+
+
+
+
+
+## error plot
+from scipy.stats import gaussian_kde
+i=2
+
+if i==0:   
+    Property='Transmissivity (%)'
+elif i==1:
+    Property='Reflectivity (%)'
+else:
+    Property='Absorptivity (%)'
+
+x=testy[:,i]
+error=np.array(testy[:,i]- pred[:,i])
+#RMSE=sqrt(np.mean(error**2))
+#print(r_squared,RMSE )
+
+y=error
+xy = np.vstack([x,y])
+z = gaussian_kde(xy)(xy)
+
+# Sort the points by density, so that the densest points are plotted last
+idx = z.argsort()
+x, y, z = x[idx], y[idx], z[idx]
+
+#fig, ax = pyplot.subplots()
+#ax.scatter(x, y, c=z*100, s=20, edgecolor='')
+fig = pyplot.figure()
+pyplot.scatter(x, y, c=np.log10(z), s=20, edgecolor='')
+#pyplot.colorbar()
+pyplot.xlabel('Target',fontsize=12, color='black')
+pyplot.ylabel('Error',fontsize=12, color='black')
+pyplot.title(Property)
+
+pyplot.show()
+
+
+
+
+
+
+#correlation_matrix = np.corrcoef(testy[:,1], pred[:,1])
+#correlation_xy = correlation_matrix[0,1]
+#r_squared = correlation_xy**2
+#error=np.array(testy[:,1]- pred[:,1])
+#pyplot.scatter(testy[:,1],error)
+#plt.xlabel('reflectivty (target)',fontsize=12, color='black')
+#
+#plt.ylabel('error',fontsize=12, color='black')
+#
+#RMSE=sqrt(np.mean(error**2))
+#print(r_squared,RMSE )
+#
+#
+#correlation_matrix = np.corrcoef(testy[:,2], pred[:,2])
+#correlation_xy = correlation_matrix[0,1]
+#r_squared = correlation_xy**2
+#error=np.array(testy[:,2]-pred[:,2])
+#RMSE=sqrt(np.mean(error**2))
+#print(r_squared,RMSE )
+
+#colors = (0,0,0)
+#area = np.pi*20
+#pyplot.scatter(testy[:,0], pred[:,0], s=area, c=colors, alpha=0.5)
+
+## regression plot with density
+from scipy.stats import gaussian_kde
+i=2 # 0 for trans  1 for reflect   2 for abosrptioin
+if i==0:   
+    Property='Transmissivity (%)'
+elif i==1:
+    Property='Reflectivity (%)'
+else:
+    Property='Absorptivity (%)'
+x=np.array(testy[:,i])
+y=np.array(pred[:,i])
+xy = np.vstack([x,y])
+z = gaussian_kde(xy)(xy)
+# Sort the points by density, so that the densest points are plotted last
+idx = z.argsort()
+x, y, z = x[idx], y[idx], z[idx]
+#fig, ax = pyplot.subplots()
+#ax.scatter(x, y, c=z*100, s=20, edgecolor='')
+
+fig = pyplot.figure()
+pyplot.scatter(x, y, c=np.log10(z), s=30, edgecolor='')
+#pyplot.colorbar()
+pyplot.xlabel('Target',fontsize=12, color='black')
+pyplot.ylabel('Predicted',fontsize=12, color='black')
+pyplot.title(Property)
+
+# testting performance metric 
+correlation_matrix = np.corrcoef(testy[:,i], pred[:,i])
+correlation_xy = correlation_matrix[0,1]
+r_squared = correlation_xy**2
+error=np.array(testy[:,i]- pred[:,i])
+#pyplot.scatter(testy[:,0],error)
+RMSE=sqrt(np.mean(error**2))
+print(r_squared,RMSE )
+text='RMSE = '+str(round(RMSE,3))
+pyplot.text(20, 50,text)
+text=r'$R^{2} = $'+str(round(r_squared,5))
+pyplot.text(20, 60,text)
+pyplot.show()
+#correlation_matrix = np.corrcoef(testy, pred)
+#correlation_xy = correlation_matrix[0,1]
+#r_squared = correlation_xy**2
+#print(r_squared)
+
+
+## validation  performance metric 
+#i=2
+#correlation_matrix = np.corrcoef(valy[:,i], val_pred[:,i])
+#correlation_xy = correlation_matrix[0,1]
+#r_squared = correlation_xy**2
+#error=np.array(valy[:,i]- val_pred[:,i])
+##pyplot.scatter(testy[:,0],error)
+#RMSE=sqrt(np.mean(error**2))
+#print(r_squared,RMSE )
+
