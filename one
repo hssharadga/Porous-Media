@@ -1,0 +1,4742 @@
+import json, copy, sys, time
+import numpy as np
+import ipopt
+from scipy.sparse import coo_matrix
+from solution_writer import write_solution, write_solution_single_timestep
+
+import gurobipy as gp
+from gurobipy import GRB
+
+
+# Time Count
+import timeit
+start = timeit.default_timer()
+
+
+
+# Switching
+# 0: False
+# 1: True
+
+# Line Switching
+L_S=0     
+
+# Device Switching
+device_switching=1
+
+
+
+
+'''
+To DO:
+
+- Energy constraints
+
+'''
+
+'''
+FIRST PASS THINGS I AM IGNORING:
+
+- Shunt switching
+
+- Reserves? Don't really understand these
+
+- Contingencies
+
+Format of decision variable will just be v1...vT theta1.. thetaT pj1... pjT qj1... qjT
+
+'''
+
+args = sys.argv
+src_data = args[1]
+timelimit = args[2]
+div = args[3]
+
+div=int(div)
+
+
+
+network = args[4]
+allow_switching = args[5]
+
+
+
+# This will be the filepath that the solution writes to
+outfile = 'solution.json'
+
+file = open(src_data)
+data = json.load(file)
+    
+# Numbers of each element
+n_b = len(data['network']['bus']) # number of buses
+n_s = len(data['network']['shunt'])
+n_j = len(data['network']['simple_dispatchable_device']) 
+n_t = data['time_series_input']['general']['time_periods']
+n_t_ = data['time_series_input']['general']['time_periods']
+# n_t_=1
+delta_t = [t for t in data['time_series_input']['general']['interval_duration']]
+delta_t_ = [t for t in data['time_series_input']['general']['interval_duration']]
+t_map = {} # map of timesteps to hr
+t0 = 0
+
+
+
+if n_b>8316:
+    device_switching=0
+    
+    
+    
+    
+# if n_b>2000:               no need to skip MILP
+#     device_switching=0
+
+# note: currently only branch slacks is not supported
+bus_slacks = True
+branch_slacks = True
+branch_lims = True
+q_bounds = True
+if n_b > 2000:
+    branch_slacks = False
+    branch_lims = False
+if n_b >= 2000:
+#     device_switching = 0
+    delta_t = [delta_t[0]]
+    n_t0 = copy.deepcopy(n_t)
+    n_t = 1
+#if n_b > 5000:
+#    q_bounds = False
+
+#delta_t = [delta_t[0]]
+#n_t = 1
+
+t0_ = time.time()
+
+pviol_cost = data["network"]["violation_cost"]["p_bus_vio_cost"]
+qviol_cost = data["network"]["violation_cost"]["q_bus_vio_cost"]
+sviol_cost = data["network"]["violation_cost"]["s_vio_cost"]
+
+for t in range(len(delta_t)):
+    t_map[t0] = t
+    t0 += delta_t[t]
+
+# ==== Parameters ===
+
+# Bus voltage - do not vary with time
+v_min = []
+v_max = []
+v0 = []
+theta0 = []
+
+# Shunts
+gs = []
+bs = []
+ush_min = []
+ush_max = []
+ush0 = []
+
+# Devices
+pl0 = np.zeros((n_b*n_t,)) # uncontrollable base load
+pj0 = np.zeros((n_j,)) # The initial consumption of each device at t=0
+qj0 = np.zeros((n_j,)) # The initial consumption of each device at t=0
+pj_min = np.zeros((n_j*n_t))
+pj_min_all=np.zeros((n_j*n_t_))
+pj_max = np.zeros((n_j*n_t))
+pj_max_all = np.zeros((n_j*n_t_))
+
+
+#>
+if device_switching==1:
+    pj_min_ = np.zeros((n_j,n_t))
+    pj_max_=np.zeros((n_j,n_t)) 
+
+qj_min = np.zeros((n_j*n_t))
+qj_max = np.zeros((n_j*n_t))
+en_min = np.zeros((n_j,))
+en_max = np.zeros((n_j,))
+pru = np.zeros((n_j,))
+prd = np.zeros((n_j,))
+prgu_ub = np.zeros((n_j,))
+prgd_ub = np.zeros((n_j,))
+syn_ub = np.zeros((n_j,))
+nsyn_ub = np.zeros((n_j,))
+rru_on_ub = np.zeros((n_j,))
+rru_off_ub = np.zeros((n_j,))
+rrd_on_ub = np.zeros((n_j,))
+rrd_off_ub = np.zeros((n_j,))
+
+#pru_su = np.zeros((n_j,))
+#prd_sd = np.zeros((n_j,))
+# >
+prusu=[] 
+prdsd=[]
+
+
+
+if n_b<2000:
+    n_tt=n_t_ 
+elif div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    n_tt=n_t_
+else: # one-step Ipopt
+    n_tt=1
+ 
+
+    
+# if div>1:
+#     n_tt=n_t_
+# else:
+#     n_tt=1
+    
+    
+prgu_cost = np.zeros((n_j*n_tt,))
+# prgu_cost_all = np.zeros((n_j*n_tt,))
+prgd_cost = np.zeros((n_j*n_tt,))
+# prgd_cost_all = np.zeros((n_j*n_tt,))
+syn_cost = np.zeros((n_j*n_tt,))
+# syn_cost_all = np.zeros((n_j*n_tt,))
+nsyn_cost = np.zeros((n_j*n_tt,))
+cru_on = np.zeros((n_j*n_tt,))
+cru_off = np.zeros((n_j*n_tt,))
+crd_on = np.zeros((n_j*n_tt,))
+crd_off = np.zeros((n_j*n_tt,))
+
+# zones
+azn = {}
+n_az = len(data['network']['active_zonal_reserve'])
+azr_map = {}
+rzr_map = {}
+for z in range(n_az):
+    azr_map[data['network']['active_zonal_reserve'][z]['uid']] = z
+    azn[z] = np.zeros((n_b))
+
+# BUSES
+bus_map = {}
+for i in range(n_b):
+    # Params
+    v_min.append(data['network']['bus'][i]['vm_lb'])
+    v_max.append(data['network']['bus'][i]['vm_ub'])
+    v0.append(data['network']['bus'][i]['initial_status']['vm'])
+    theta0.append(data['network']['bus'][i]['initial_status']['va'])
+    
+    # Maps
+    bus_map[data['network']['bus'][i]['uid']] = i
+    for uid in data['network']['bus'][i]['active_reserve_uids']:
+        azn[azr_map[uid]][i] = 1.0
+    #ar_map['uid'] = 
+    #rr_map['uid'] = data['network']['bus'][i]['reactive_reserve_uids']
+
+v_min = np.array(v_min*n_t)
+v_max = np.array(v_max*n_t)
+v0 = np.array(v0*n_t)
+theta0 = np.array(theta0*n_t)
+
+# SHUNTS
+rows = [] # to build connected to matrix
+cols = []
+vals = []
+rows2 = []
+cols2 = []
+vals2 = []
+shunt_map = {}
+
+for s in range(n_s):
+    shunt_map[data['network']['shunt'][s]['uid']] = s
+    # Params
+    gs.append(data['network']['shunt'][s]['gs'])
+    bs.append(data['network']['shunt'][s]['bs'])
+    ush_min.append(data['network']['shunt'][s]['step_ub'])
+    ush_max.append(data['network']['shunt'][s]['step_lb'])
+    ush0.append(data['network']['shunt'][s]['initial_status']['step'])
+    
+    # Maps
+    for t in range(n_t):
+        rows += [bus_map[data['network']['shunt'][s]['bus']]+t*n_b]
+        cols += [s+t*n_s]
+
+# gs_ = np.array(gs*n_t_)
+# bs_ = np.array(bs*n_t_)
+
+gs = np.array(gs*n_t)
+bs = np.array(bs*n_t)
+ush0 = np.array(ush0*n_t)
+ush_min = np.array(ush_min*n_t)
+ush_max = np.array(ush_max*n_t)
+
+# Matrix mapping
+s_connected = coo_matrix(([1.]*(n_s*n_t), (rows, cols)),shape=(n_b*n_t,n_s*n_t))
+
+j_bus_map = {}
+j_map = {}
+sign = {} # pos (generation) or negative (consumption)
+#
+#>
+if device_switching==1:
+    sign_ = {} # negative (generation) or Postive (consumption)
+
+# 
+#>
+if device_switching==1:
+    
+    su_cost=[] # startup cost
+    sd_cost=[]
+    on_cost=[]
+    j_on_0 = []
+    # (56)-(57)
+    down_time=[] 
+    up_time=[]
+    startups_ub={}
+    # (68)-(69)
+    Wen_max={}          
+    Wen_min={}
+
+
+if device_switching==0:
+    j_on = []
+
+en_ub = {}
+en_lb = {}
+
+#q_bound_map = {}
+rows = [] # for mapping p or q to the q bounds
+cols = []
+n_qb = 0
+n_qc = 0
+qc_map = {}
+qb_map = {}
+beta = []
+q0 = []
+beta = []
+q0max = []
+q0min = []
+beta_min = []
+beta_max = []
+for j in range(n_j):
+    en_ub[j] = []
+    en_lb[j] = []
+    # first check if device is on at start, skip if not ==> Come back to this later
+    if device_switching==0:
+        j_on.append(data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'])
+        
+    #
+    #>
+    if device_switching==1:
+        j_on_0.append(data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'])
+    
+    pj0[j] = data['network']['simple_dispatchable_device'][j]['initial_status']['p']
+    qj0[j] = data['network']['simple_dispatchable_device'][j]['initial_status']['q']
+    if data['network']['simple_dispatchable_device'][j]['device_type'] == 'consumer':
+        sign[data['network']['simple_dispatchable_device'][j]['uid']] = -1
+        
+        #>
+        if device_switching==1:
+            sign_[data['network']['simple_dispatchable_device'][j]['uid']] = 1
+            
+    else:
+        sign[data['network']['simple_dispatchable_device'][j]['uid']] = 1
+        #>
+        if device_switching==1:
+            sign_[data['network']['simple_dispatchable_device'][j]['uid']] = -1 
+        
+    #j_sgn.append(sign[data['network']['simple_dispatchable_device'][j]['uid']])
+    j_bus_map[j] = bus_map[data['network']['simple_dispatchable_device'][j]['bus']]
+    j_map[data['network']['simple_dispatchable_device'][j]['uid']] = j
+    
+    if data['network']['simple_dispatchable_device'][j]['q_bound_cap'] == 1:
+        beta_min.append(data['network']['simple_dispatchable_device'][j]['beta_ub'])
+        beta_max.append(data['network']['simple_dispatchable_device'][j]['beta_lb'])
+        q0max.append(data['network']['simple_dispatchable_device'][j]['q_0_ub'])
+        q0min.append(data['network']['simple_dispatchable_device'][j]['q_0_lb'])
+        qb_map[j] = n_qb
+        n_qb += 1
+    if data['network']['simple_dispatchable_device'][j]['q_linear_cap'] == 1:
+        beta.append(data['network']['simple_dispatchable_device'][j]['beta'])
+        q0.append(data['network']['simple_dispatchable_device'][j]['q_0'])
+        qc_map[j] = n_qc
+        n_qc += 1
+    
+    # Ramping constraints
+    pru[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_up_ub']
+    prd[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_down_ub']
+    #pru_su[j] = data['network']['simple_dispatchable_device'][j]['p_startup_ramp_ub'] 
+    #prd_sd[j] = data['network']['simple_dispatchable_device'][j]['p_shutdown_ramp_ub']
+    
+    
+    # >
+    prusu.append(data['network']['simple_dispatchable_device'][j]['p_startup_ramp_ub'])
+    prdsd.append(data['network']['simple_dispatchable_device'][j]['p_shutdown_ramp_ub'])
+    
+    
+    # Reserve upper bounds
+    prgu_ub[j] = data['network']['simple_dispatchable_device'][j]['p_reg_res_up_ub']
+    prgd_ub[j] = data['network']['simple_dispatchable_device'][j]['p_reg_res_down_ub']
+    syn_ub[j] = data['network']['simple_dispatchable_device'][j]['p_syn_res_ub']
+    nsyn_ub[j] = data['network']['simple_dispatchable_device'][j]['p_nsyn_res_ub']
+    rru_on_ub[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_res_up_online_ub']
+    rru_off_ub[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_res_up_offline_ub']
+    rrd_on_ub[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_res_down_online_ub']
+    rrd_off_ub[j] = data['network']['simple_dispatchable_device'][j]['p_ramp_res_down_offline_ub']
+    
+    
+    #
+    #>
+    if device_switching==1:
+        su_cost.append( data['network']['simple_dispatchable_device'][j]['startup_cost']) # startup cost
+        sd_cost.append(data['network']['simple_dispatchable_device'][j]['shutdown_cost'])   
+        on_cost.append(data['network']['simple_dispatchable_device'][j]['on_cost']) 
+        down_time.append(data['network']['simple_dispatchable_device'][j]['down_time_lb'])
+        up_time.append(data['network']['simple_dispatchable_device'][j]['in_service_time_lb'])       
+        startups_ub[j]=data['network']['simple_dispatchable_device'][j]['startups_ub']
+        Wen_max[j]=data['network']['simple_dispatchable_device'][j]['energy_req_ub']
+        Wen_min[j]=data['network']['simple_dispatchable_device'][j]['energy_req_lb']
+    
+    # Energy constraints - skipping for now
+    '''
+    for enlb in data['network']['simple_dispatchable_device'][j]['energy_req_lb']:
+        if enlb[2] == 0:
+            continue
+        print(enlb)
+        #s = t_map[float(enlb[0])]
+        #e_hr = enlb[1]
+    for enub in data['network']['simple_dispatchable_device'][j]['energy_req_ub']:
+        if enub[2] == 9999:
+            continue
+        print(enub)'''
+    
+j_sgn = np.ones((n_j*n_t,))
+# 
+#>
+if device_switching==1:
+    j_sgn_ = np.ones((n_j,))
+
+# if device_switching==0:
+# starting by leaving devices in initial on/off position
+
+
+
+
+if n_b<2000:
+    n_tt=n_t_ 
+elif div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    n_tt=n_t_
+else: # one-step Ipopt
+    n_tt=1
+    
+# if device_switching==0: # need to be adjusted if  device_switching==0
+#     if div>1:             
+#         j_on = np.array(j_on*n_t_)
+#     else:
+#         j_on = np.array(j_on*n_t)   
+
+if device_switching==0: # need to be adjusted if  device_switching==0 
+    j_on = np.array(j_on*n_tt)
+    
+    
+    
+    
+        
+beta = np.array(beta*n_t)
+q0 = np.array(q0*n_t)
+beta_min = np.array(beta_min*n_t)
+beta_max = np.array(beta_max*n_t)
+q0min = np.array(q0min*n_t)
+q0max = np.array(q0max*n_t)
+
+# For devices we need two steps: one isolating cost blocks and modelling each as seperate device
+
+# Then a matrix which maps each load id to a list of load indices.
+
+# Ramping limits will be on sum of block. Cost is conex/concave so order is unimportant
+
+n_je = 0
+je_i_map  = {}
+je_t_map  = {}
+je_j_map  = {}
+c_en = []
+pje_max = []
+j_t_je_map = {}
+
+rows = [] # mapping for je to bus, time
+cols = []
+vals = []
+rows2 = [] # mapping for j,t to bus, time
+cols2 = []
+vals2 = []
+pje0 = []
+delta_tj = []
+# simple dispathcable device
+
+# for ramping constraints we will also need a matrix which maps je_to_j
+rows3 = []
+cols3 = []
+
+# for fixed load factor
+rows4 = []
+cols4 = []
+
+# rows for bounded load factor
+rows5 = []
+cols5 = []
+
+# for energy constraint
+#rows4 = []
+#cols4 = []
+#vals4 = []
+
+j_je={}   # (device j, time t): je indices
+j_j2 = {}
+
+
+# upper and lower bound on devices
+#>
+if device_switching==1:
+    j_on_ub={}
+    j_on_lb={}
+
+    
+prup = np.array([None]*(n_j*n_t))
+prdn = np.array([None]*(n_j*n_t))
+
+
+
+#  Controllable load Version for MIP
+if device_switching==1:  
+    
+    for j2 in range(n_j):
+        # GAHHH ORDER NOT PRESETVED BETWEEN LISTS
+        uid = data['time_series_input']['simple_dispatchable_device'][j2]['uid']
+        j = j_map[uid]
+        i = j_bus_map[j]
+
+        j_t_je_map[j] = {}
+        j_j2[j] = j2
+        
+        j_sgn_[j] = sign_[uid]
+
+        j_on_ub[j]=data['time_series_input']['simple_dispatchable_device'][j2]['on_status_ub']    
+        j_on_lb[j]=data['time_series_input']['simple_dispatchable_device'][j2]['on_status_lb']
+
+
+        for t in range(n_t):
+            j_t_je_map[j][t] = []
+
+            pmax = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][t]
+            pmin = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][t]
+
+            # Q upper and lower bounds
+            # qj_max[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'][t]
+            # qj_min[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'][t]
+
+
+            pj_min_[j][t] = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][t]
+            pj_max_[j][t] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][t]
+
+
+            # First let's seperate out the uncontrollable generation or demand
+            #pl0[i+t*n_j] += pmin*sign[uid]
+            # _p0 = copy.deepcopy(pj0[j])
+
+            # We are minimizing COST of generation, so cost should be positive, benefit should be negative
+            cost_blocks = [[float(b[0])*sign_[uid], b[1]] for b in data['time_series_input']['simple_dispatchable_device'][j2]['cost'][t]]
+
+            cost_blocks = sorted(cost_blocks, reverse=True) # Highest cost consuming  / lowest cost of producing first
+                                                            # That is to maximize the market surplus
+
+            # print(cost_blocks)                                                
+            _p = 0
+            first = 1
+
+            j_je_local=[]
+            for b in range(len(cost_blocks)):
+                # if _p+cost_blocks[b][1] <= pmin:
+                #     low+=1
+                # if pmax<=cost_blocks[b][1]:
+                #     high+=1
+                    # print(j2)
+                    # print(t)
+
+
+                if _p >= pmax:
+                    continue
+                # if _p+cost_blocks[b][1] <= pmin: # skip if whole block uncontrollable
+                #     continue
+                # _p is total load not including current block
+                # pmin is total uncontrollable load
+                # pmax is the total possible load (uncontrolled + controllable)
+                # _p0 is the total initial load
+                # cost_blocks[b][1] is the amount of load IN THIS BLOCK (not cumulative)
+
+                # pj_0.append(min(max(0,_p0-_p),cost_blocks[b][1]+first*(_p-pmin)))
+
+
+                # pje_max.append(min(pmax-_p,cost_blocks[b][1]+first*(_p-pmin)))
+                pje_max.append(min(pmax-_p,cost_blocks[b][1]))
+                first = 0 
+
+                c_en.append(cost_blocks[b][0])
+                delta_tj.append(delta_t[t])
+                _p += cost_blocks[b][1]            
+
+                je_i_map[n_je]  = i
+                je_t_map[n_je]  = t
+                j_t_je_map[j][t].append(n_je)
+                # rows += [i+n_b*t]
+                # cols += [n_je]
+                # vals += [sign[uid]]
+
+                # rows3 += [j+n_j*t]
+                # cols3 += [n_je]
+
+                j_je_local+=[n_je]
+
+
+                n_je += 1
+
+            j_je[j,t]=j_je_local
+
+
+
+        
+#>
+if device_switching==1:
+    # Coverting the dic to matrix to comply with gurobi format
+    
+    j_on_lb_=np.zeros((n_j,n_t_))
+    j_on_ub_=np.zeros((n_j,n_t_))
+
+    for j in range(n_j):
+        for t in range(n_t_):
+
+            j_on_lb_[j][t]=j_on_lb[j][t]
+            j_on_ub_[j][t]=j_on_ub[j][t]
+
+    j_on_lb=j_on_lb_
+    j_on_ub=j_on_ub_
+    
+    #                  
+    pj_max_ = np.array(pj_max_)
+    c_en = np.array(c_en)
+    delta_tj = np.array(delta_tj)
+
+
+
+
+#branch_map = {} not sure if we will need this or not for now
+rows = []
+cols = []
+rows2 = []
+
+fr_to={}  # device(j): from bus  to bus 
+
+# branches time - do AC first then DC
+f = 0
+f_ = 0
+n_f = (len(data['network']['ac_line'])+len(data['network']['two_winding_transformer']))
+branch_map = {}
+f_on = np.ones((n_f)) # TEMPORARY
+
+# 
+if device_switching==1:
+    f_on_0 = np.ones((n_f,)) # TEMPORARY
+Bf = np.zeros((n_f,))
+
+
+sf = np.zeros((n_f,))
+bf = np.zeros((n_f,))
+bfCH = np.zeros((n_f,))
+gf = np.zeros((n_f,))
+g_fr = np.zeros((n_f,))
+g_to = np.zeros((n_f,))
+b_fr = np.zeros((n_f,))
+b_to = np.zeros((n_f,))
+tauf = np.ones((n_f,))
+thetaf = np.zeros((n_f,))
+
+# 
+s_max = np.zeros((n_f,)) # branch flow limit (130)-(131)
+
+# 
+pdc_max_ = {}
+su_cost_f=np.zeros((n_f)) # (50)-(51)
+sd_cost_f=np.zeros((n_f))
+
+
+
+for ac in data['network']['ac_line']:
+    f_on[f] = ac['initial_status']['on_status']
+    
+    #>
+    if device_switching==1:
+        f_on_0[f]=ac['initial_status'] ['on_status']
+        fr_to[f]=[bus_map[ac['fr_bus']],bus_map[ac['to_bus']]]
+        
+    su_cost_f[f]=ac['connection_cost']
+    sd_cost_f[f]=ac['disconnection_cost']
+    
+    x = ac['x']
+    Bf[f]=1/x
+    s_max[f]=ac['mva_ub_nom']
+    
+    
+    for t in range(n_t):
+        rows += [bus_map[ac['fr_bus']]+t*n_b]
+        rows2 += [bus_map[ac['to_bus']]+t*n_b]
+        cols += [t*n_f+f]
+    r = ac['r']
+    x = ac['x']
+    z = r*r+x*x
+    bf[f] = -x/z
+    gf[f] = r/z
+    sf[f] = ac['mva_ub_nom']
+    bfCH[f] = ac['b'] # check that this is the right parameter
+    if ac['additional_shunt'] == 1:
+        g_fr[f] = ac['g_fr']
+        g_to[f] = ac['g_to']
+        b_fr[f] = ac['b_fr']
+        b_to[f] = ac['b_to']
+    branch_map[ac['uid']] = f
+    f += 1
+    
+    #
+    f_ += 1
+    
+#>
+if device_switching==1:
+    dc_f=[] # dc devices
+    for dc in data['network']['dc_line']:
+        # print(f)
+        dc_f+=[f_]
+
+        fr_to[f_]=[bus_map[dc['fr_bus']],bus_map[dc['to_bus']]]
+
+        # s_max[f]=dc['mva_ub_nom']     # does not apply to dc lines
+        pdc_max_[f_] = dc['pdc_ub']
+
+        #f_ += 1
+    
+    
+
+for xfm in data['network']['two_winding_transformer']:
+    f_on[f] = xfm['initial_status']['on_status']
+    if device_switching==1:
+        f_on_0[f_]=xfm['initial_status'] ['on_status']
+        fr_to[f_]=[bus_map[xfm['fr_bus']],bus_map[xfm['to_bus']]]
+
+        su_cost_f[f_]=xfm['connection_cost']
+        sd_cost_f[f_]=xfm['disconnection_cost']
+
+    
+    for t in range(n_t):
+        rows += [bus_map[xfm['fr_bus']]+t*n_b]
+        rows2 += [bus_map[xfm['to_bus']]+t*n_b]
+        cols += [t*n_f+f]
+    thetaf[f] = xfm['initial_status']['ta'] # FOR NOW JUST LEAVING XFM IN INITIAL POSITION
+    tauf[f] = xfm['initial_status']['tm']
+    r = xfm['r']
+    x = xfm['x']
+    z = r*r+x*x
+    bf[f] = -x/z
+    gf[f] = r/z
+    bfCH[f] = xfm['b']
+    sf[f] = xfm['mva_ub_nom']
+    if xfm['additional_shunt'] == 1:
+        g_fr[f] = xfm['g_fr']
+        g_to[f] = xfm['g_to']
+        b_fr[f] = xfm['b_fr']
+        b_to[f] = xfm['b_to']
+    
+    if device_switching==1:
+        x = xfm['x']
+        # z = r*r+x*x
+        # bf[f] = -x/z
+        Bf[f_]=1/x
+        s_max[f_]=xfm['mva_ub_nom']
+    
+    
+    branch_map[xfm['uid']] = f
+    
+    f += 1
+    f_ += 1
+    
+    
+f_on = np.array(list(f_on)*n_t)
+sf = np.array(list(sf)*n_t)
+bf = np.array(list(bf)*n_t)
+gf = np.array(list(gf)*n_t)
+bfCH = np.array(list(bfCH)*n_t)
+tauf = np.array(list(tauf)*n_t)
+thetaf = np.array(list(thetaf)*n_t)
+g_fr = np.array(list(g_fr)*n_t)
+b_fr = np.array(list(b_fr)*n_t)
+g_to = np.array(list(g_to)*n_t)
+b_to = np.array(list(b_to)*n_t)
+
+# Only after ALL branches are done
+fo_connected = coo_matrix(([1.]*(n_f*n_t), (rows, cols)),shape=(n_b*n_t,n_f*n_t))
+fd_connected = coo_matrix(([1.]*(n_f*n_t), (rows2, cols)),shape=(n_b*n_t,n_f*n_t))
+
+dc_map = {}
+rows = []
+rows2 = []
+cols = []
+
+n_dc = len(data['network']['dc_line']) # still need to do this
+e = 0
+pdc_max = []
+qdc_fr_max = []
+qdc_to_max = []
+qdc_fr_min = []
+qdc_to_min = []
+pdc0 = []
+qdc_fr0 = []
+qdc_to0 = []
+
+for dc in data['network']['dc_line']:
+    dc_map[dc['uid']] = e
+    for t in range(n_t):
+        rows += [bus_map[dc['fr_bus']]+t*n_b]
+        rows2 += [bus_map[dc['to_bus']]+t*n_b]
+        cols += [e+t*n_dc]
+    
+    pdc_max.append(0)#dc['pdc_ub'])
+    qdc_fr_max.append(0)#dc['qdc_fr_ub'])
+    qdc_to_max.append(0)#dc['qdc_to_ub'])
+    qdc_fr_min.append(0)#dc['qdc_fr_lb'])
+    qdc_to_min.append(0)#dc['qdc_to_lb'])
+    pdc0.append(0)#dc['initial_status']['pdc_fr'])
+    #pdc_max.append(dc['pdc_ub'])
+    #qdc_fr_max.append(dc['qdc_fr_ub'])
+    #qdc_to_max.append(dc['qdc_to_ub'])
+    #qdc_fr_min.append(dc['qdc_fr_lb'])
+    #qdc_to_min.append(dc['qdc_to_lb'])
+    #pdc0.append(dc['initial_status']['pdc_fr'])
+    qdc_fr0.append(dc['initial_status']['qdc_fr'])
+    qdc_to0.append(dc['initial_status']['qdc_to'])
+              
+    e += 1
+
+pdc_max = np.array(pdc_max*n_t)
+qdc_fr_max = np.array(qdc_fr_max*n_t)
+qdc_to_max = np.array(qdc_to_max*n_t)
+qdc_fr_min = np.array(qdc_fr_min*n_t)
+qdc_to_min = np.array(qdc_to_min*n_t)
+pdc0 = np.array(pdc0*n_t)
+qdc_fr0 = np.array(qdc_fr0*n_t)
+qdc_to0 = np.array(qdc_to0*n_t)
+
+do_connected = coo_matrix(([1.]*(n_dc*n_t), (rows, cols)),shape=(n_b*n_t,n_dc*n_t))
+dd_connected = coo_matrix(([1.]*(n_dc*n_t), (rows2, cols)),shape=(n_b*n_t,n_dc*n_t))
+
+
+file.close()
+
+# Assuming no tap changes
+#tauf = np.array(tauf*n_t)
+#thetaf = np.array(thetaf*n_t)
+
+
+
+# MIP Code
+
+#>
+if device_switching==1:
+    fr_bus={}   # bus: device (j) or devices (j, ..)
+    to_bus={}   # bus: device (j) or devices (j, ..)
+
+    for i in range(n_b):
+
+        fr_bus[i]={}
+        to_bus[i]={}
+
+
+    for f in range(n_f):
+        if f not in (dc_f):
+            fr_bus[fr_to[f][0]]=list(fr_bus[fr_to[f][0]])+[f]
+            to_bus[fr_to[f][1]]=list(to_bus[fr_to[f][1]])+[f]
+
+
+    bus_j_map={} # bus: devices 
+
+    for i in range(n_b):
+        colect=[]
+        for j in range (n_j):
+
+            if j_bus_map[j]==i:
+                colect+=[j]
+        bus_j_map[i]=colect
+   
+
+
+#     ZON=[delta_t[t]*on_cost[j]*j_on_0[j] for t in range(n_t) for j in range (n_j)]
+#     ZON=sum(ZON)
+#     print('ZON of NLP =', ZON)
+#     ZSU=0
+#     ZSD=0
+
+    
+    
+    
+# >> MIP Model    
+
+if device_switching==1:
+    if n_b<2000:
+    
+        # Model
+        m=gp.Model()
+        # m.params.presolve=0
+        # m.Params.FeasibilityTol = 1e-3
+        # IntFeasTol=1e-2
+        m.Params.MIPGap=0.01
+        # m.Params.TIME_LIMIT = 60*60*2
+
+        # m.Params.NoRelHeurTime=20 
+        # m.Params.Threads=1
+
+        # m.setParam("Method",3) #
+        # m.setParam("DegenMoves",0) 
+        # m.Params.MIPFocus=3
+
+        # Assign variables
+        theta = m.addVars(n_b, n_t, vtype='C', lb=-np.pi , ub=np.pi)
+        pje = m.addVars(n_je, vtype='C', lb=0 , ub=pje_max)
+
+        # Pj can be zero according to linear formulation. lb is pjmin in the quadratic formulation
+        # pj = m.addVars(n_j,n_t, vtype='C', lb=pj_min_ , ub=pj_max_) 
+        pj = m.addVars(n_j,n_t, vtype='C') 
+
+        j_on = m.addVars(n_j,n_t,vtype=GRB.BINARY,lb=j_on_lb, ub=j_on_ub) 
+
+        if L_S==1:
+            f_on_ = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+        else:
+            f_on_= np.transpose([f_on_0] * n_t)
+
+
+        # bounds on power
+        ub_=np.max(pj_max_)*n_j
+        lb_=-ub_
+        # ub_=GRB.INFINITY
+        # lb_=-GRB.INFINITY
+
+
+        # bus power (one_time usage)
+        P= m.addVars(n_b, n_t, vtype='C', lb=lb_, ub=ub_)      # Consuming(+)  Producing (-)
+        P_fr= m.addVars(n_b, n_t, vtype='C', lb=lb_ , ub=ub_)  # 
+        P_to= m.addVars(n_b, n_t, vtype='C', lb=lb_, ub=ub_)   # 
+        Pmis= m.addVars(n_b, n_t, vtype='C', lb=lb_ , ub=ub_ ) # 
+        Pmis_plus= m.addVars(n_b, n_t, vtype='C', lb=0  , ub=ub_) # 
+
+        # Shunt
+        # Ps= m.addVars(n_b, n_t, vtype='C', lb=0, ub=GRB.INFINITY) # 
+        # ush=m.addVars(n_s, vtype=GRB.INTEGER, lb=ush_min, ub=ush_max) #
+
+        # v= m.addVars(n_b, n_t, vtype='C', lb=v_min, ub=v_max) # 
+        # v2= m.addVars(n_b, n_t, vtype='C', lb=v_min2, ub=v_max2) # v2==v^2
+
+        # Branch
+        P_fr_f = m.addVars(n_f,n_t, vtype='C', lb=lb_ , ub=ub_) 
+        P_to_f = m.addVars(n_f,n_t, vtype='C', lb=lb_ , ub=ub_) 
+
+
+
+        # Branch Limits
+        s_plus= m.addVars(n_f,n_t,vtype='C', lb=0) # (128)
+
+        zen= m.addVars(n_j, n_t, vtype='C', lb=-GRB.INFINITY, ub=GRB.INFINITY) 
+
+
+
+
+        # Absolut value of power mismatch Constraints (4)-(7) (6 and 7 eliminated):
+
+        for i in range(n_b):
+            for t in range (n_t):
+                m.addConstr(Pmis_plus[i,t]>=Pmis[i,t],name='c0')
+                m.addConstr(Pmis_plus[i,t]>=-Pmis[i,t], name='c1')
+
+
+
+
+        # Power Balance Constraint (10):
+        # start:
+
+        for t in range (n_t):  
+            for i in range(n_b):
+
+                j_at_bus=bus_j_map[i]   # find the devices belongs to this bus       
+
+
+
+                # linear version:
+                m.addConstr(P[i,t]==gp.quicksum(pj[j,t]*j_sgn_[j] for j in j_at_bus), name='c2' )
+
+
+                #  P_fr
+                f_fr=fr_bus[i] # devices from bus that belongs to this bus
+                # P_fr[i,t]=0
+                for f in f_fr:
+                    if f not in dc_f:
+                        theta_index=fr_to[f]
+                        m.addConstr(P_fr_f[f,t]==Bf[f]*(theta[theta_index[0],t]-theta[theta_index[1],t]), name='c3')
+
+
+                        # Constraint (130): Branch flow limits
+                        # linear
+                        m.addConstr(P_fr_f[f,t]<=s_max[f]+s_plus[f,t])
+
+
+                m.addConstr(P_fr[i,t]==gp.quicksum(P_fr_f[f,t]*f_on_[f,t] for f in f_fr) )
+
+
+
+
+
+                #  P_to
+                f_to=to_bus[i]
+                # P_to[i,t]=0
+                for f in f_to:
+                    if f not in dc_f:
+                        theta_index=fr_to[f]
+                        m.addConstr(P_to_f[f,t]==-Bf[f]*(theta[theta_index[0],t]-theta[theta_index[1],t]), name='c5')
+
+
+
+                        # Constraint (131): Branch flow limits                
+                        # linear
+                        m.addConstr(P_to_f[f,t]<=s_max[f]+s_plus[f,t])
+
+
+                m.addConstr(P_to[i,t]==gp.quicksum(P_to_f[f,t]*f_on_[f,t] for f in f_to) )
+
+
+
+
+                # P_s
+                # shunts=bus_shunt_map[i] # shunts of the current bus
+
+                # m.addConstr(Ps[i,t]==gp.quicksum(gs[s]*ush[s]*v2[i,t] for s in shunts) , name='c8')
+                # m.addConstr(Ps[i,t]==gp.quicksum(gs[s]*ush[s] for s in shunts) , name='c8')
+
+
+
+        # with shunt power            
+        # m.addConstrs((P[i,t]+Ps[i,t]+P_fr[i,t]+P_to[i,t]==Pmis[i,t] for i in range(n_b) for t in range (n_t)), name='c9')
+
+        # no shunt power
+        m.addConstrs((P[i,t]+P_fr[i,t]+P_to[i,t]==Pmis[i,t] for i in range(n_b) for t in range (n_t)), name='c9')
+
+
+
+
+        # end of constraint (10)
+
+
+
+
+
+
+
+        # linear-version trick (slide 5) to remove the quadratic terms:
+
+        for j in range(n_j):
+            for t in range(n_t):
+
+                m.addConstr(pj[j,t]>=j_on[j,t]*pj_min_[j,t])
+                m.addConstr(pj[j,t]<=j_on[j,t]*pj_max_[j,t])
+
+
+        # # v2=v^2
+        # m.addConstrs((v2[i,t]==v[i,t]*v[i,t]   for i in range(n_b) for t in range (n_t)), name='c10')
+
+
+
+
+        # pj>=pj_min_: that is can be enforced by pj lower bound (lb=pj_min_) 
+        # Pj[j,t]=sum(pje)
+        for t in range(n_t):
+            for j in range (n_j):  
+
+                indexx=j_je[j,t] # find pje indices  of one device J at given time t
+
+                m.addConstr(pj[j,t]==gp.quicksum(pje[index] for index in indexx), name='c11')
+
+
+
+
+        # (142)-(146) 
+        # Dc line limits
+        for f in dc_f:
+            for t in range(n_t):
+
+                m.addConstr(P_fr_f[f,t]<=pdc_max_[f])   #(142)
+                m.addConstr(P_fr_f[f,t]>=-pdc_max_[f])
+
+                m.addConstr(P_to_f[f,t]<=pdc_max_[f])   #(144)
+                m.addConstr(P_to_f[f,t]>=-pdc_max_[f])
+
+                m.addConstr(P_fr_f[f,t]+P_to_f[f,t]==0)   #(146)
+
+
+
+
+
+        # on-off, startup, shoutdown
+        # (42) & (43)
+        j_su = m.addVars(n_j,n_t,vtype=GRB.BINARY)   
+        j_sd = m.addVars(n_j,n_t,vtype=GRB.BINARY) 
+
+        if L_S==1:
+            f_su = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+            f_sd = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+
+
+
+        # # (46)-(47)
+        for j in range (n_j):
+            t=0
+            m.addConstr(j_on[j,t]-j_on_0[j]==j_su[j,t]-j_sd[j,t])
+            for t in range (1,n_t):
+                m.addConstr(j_on[j,t]-j_on[j,t-1]==j_su[j,t]-j_sd[j,t], name='p1')
+
+
+        if L_S==1:
+
+            for f in range (n_f):
+                t=0
+                m.addConstr(f_on_[f,t]-f_on_0[f]==f_su[f,t]-f_sd[f,t], name='p2')
+                for t in range (1,n_t):
+                    m.addConstr(f_on_[f,t]-f_on_[f,t-1]==f_su[f,t]-f_sd[f,t], name='p3')        
+
+
+        ## (48)
+#         for t in range(n_t):
+#             for j in range (n_j):
+#                 m.addConstr(j_su[j,t]+j_sd[j,t]<=1)
+                
+        # one time switching        
+        for j in range (n_j):
+            m.addConstr(gp.quicksum(j_su[j,t]+j_sd[j,t] for t in range(n_t))<=1)
+          
+        
+        
+        
+        if L_S==1:
+            for t in range(n_t):
+                for f in range (n_f):
+                    m.addConstr(f_su[f,t]+f_sd[f,t]<=1)
+
+
+
+        # on-off startup shutdown costs
+        # (49),(50),(51)
+
+        Zon=m.addVar(vtype='C', lb=0) # Cost function        
+        m.addConstr(Zon==gp.quicksum(delta_t[t]*on_cost[j]*j_on[j,t] for t in range(n_t) for j in range (n_j)))
+
+
+        Zsu=m.addVar(vtype='C', lb=0) # Cost function  
+        if L_S==1:      
+            m.addConstr(Zsu==gp.quicksum(su_cost[j]*j_su[j,t] for t in range(n_t) for j in range (n_j))+gp.quicksum(su_cost_f[f]*f_su[f,t] for t in range(n_t) for f in range (n_f)))
+        else:
+            m.addConstr(Zsu==gp.quicksum(su_cost[j]*j_su[j,t] for t in range(n_t) for j in range (n_j)))
+
+
+
+        Zsd=m.addVar(vtype='C', lb=0) # Cost function
+        if L_S==1:        
+            m.addConstr(Zsd==gp.quicksum(sd_cost[j]*j_sd[j,t] for t in range(n_t) for j in range (n_j))+gp.quicksum(sd_cost_f[f]*f_sd[f,t] for t in range(n_t) for f in range (n_f)))
+        else:
+            m.addConstr(Zsd==gp.quicksum(sd_cost[j]*j_sd[j,t] for t in range(n_t) for j in range (n_j)))
+
+
+
+
+        # # (56)-(58):
+        T=np.zeros(n_t)
+
+        for t in range(n_t):
+
+            if t>=1:
+                T[t]=T[t-1]+delta_t[t]
+            else:
+                T[t]=delta_t[t]
+
+
+        
+        # # (56): Minimum downtime
+        for j in range(n_j):
+            
+            down_time_=down_time[j]
+            if down_time_>0:
+                T_elap=delta_t[0] 
+                st_ind=0
+
+                for t in range(1,n_t):
+                    et_ind=t
+
+                    m.addConstr(j_su[j,t]<=1-gp.quicksum(j_sd[j,t_] for t_ in range (st_ind,et_ind)))
+
+                    dt=delta_t[t]
+                    T_elap+=dt
+
+                    if T_elap>=down_time_:
+                        st_ind=st_ind+1
+                        #T_elap=0
+
+
+
+
+
+
+
+         # # (57): Minimum uptime
+        for j in range(n_j):
+            up_time_=up_time[j]
+            if up_time_>0:
+
+                T_elap=delta_t[0]
+                st_ind=0
+                m.addConstr(j_sd[j,0]==0)
+
+                for t in range(1,n_t):
+                    et_ind=t
+                    if j_on_0[0]==1 and st_ind==0:
+                        m.addConstr(j_sd[j,t]<=0)
+
+                    else: 
+                        m.addConstr(j_sd[j,t]<=1-gp.quicksum(j_su[j,t_] for t_ in range (st_ind,et_ind)))
+
+
+                    dt=delta_t[t]
+                    T_elap+=dt
+
+                    if T_elap>=up_time_:
+                        st_ind=st_ind+1
+                        #T_elap=0
+
+
+
+
+
+        # (58)   
+
+        for j in range(n_j):
+            startups_j=startups_ub[j]
+
+            if len(startups_j)>0:
+
+                for startups in startups_j: # it may have more than one matrix
+
+
+                    st=startups[0]
+                    et=startups[1]
+
+                    for t in range(n_t):
+                        if st<T[t]:
+                            st_ind=t
+                            break
+
+                    et_ind=len(T)-1 # In case the end time is higher than the control horizon     
+                    for t in range(n_t):
+                        if et<=T[t]:
+                            et_ind=t
+                            break  
+
+
+                    m.addConstr(gp.quicksum(j_su[j,t_] for t_ in range(st_ind,et_ind+1))<=startups[2])
+
+
+
+
+
+
+
+
+        # Costs & Objective
+
+        # zen=0  # producing & consuming
+        # tt=0
+        for j in range (n_j):
+            for t in range (n_t):
+                indexx=j_je[j,t]
+                m.addConstr(zen[j,t]==gp.quicksum(c_en[index]*pje[index]*delta_tj[index] for index in indexx), name='c12')
+
+
+
+
+
+
+        # (8) bus power violation/mismatch cost
+        cp=data['network']['violation_cost']['p_bus_vio_cost']
+        Zp=m.addVar(vtype='C', lb=0) # Cost function
+        m.addConstr(Zp==gp.quicksum(delta_t[t]*cp*Pmis_plus[i,t] for i in range (n_b) for t in range (n_t)))
+        # Zp=0
+
+        # (129) Branch limit penalty
+        cs=data['network']['violation_cost']['s_vio_cost']   
+        Zs=m.addVar(vtype='C', lb=0) # Cost function
+        m.addConstr(Zs==gp.quicksum(delta_t[t]*cs*s_plus[f,t] for f in range (n_f) for t in range (n_t)))
+
+
+
+
+
+
+
+
+        # ## Section 2.6.3  Maximum/Minimum Energy Over intervals
+        # (68)-(69)
+        for j in range(n_j):
+
+            Wen_max_j=Wen_max[j]
+
+            if len(Wen_max_j)>0:
+
+                for Wen_max_ in Wen_max_j:  # it might have more than one device
+
+                    st=Wen_max_[0]
+                    et=Wen_max_[1]
+
+                    for t in range(n_t):
+                        if st<T[t]:
+                            st_ind=t
+                            break
+                    et_ind=len(T)-1 # In case the end time is higher than the control horizon                
+                    for t in range(n_t):
+                        if et<=T[t]:
+                            et_ind=t
+                            break        
+
+
+                    m.addConstr(gp.quicksum(delta_t[t]*pj[j,t] for t in range(st_ind+1,et_ind))+(T[st_ind]-st)*pj[j,st_ind]+(et-T[et_ind-1])*pj[j,et_ind]<=Wen_max_[2])
+
+
+            Wen_min_j=Wen_min[j]
+
+            if len(Wen_min_j)>0:
+                for Wen_min_ in Wen_min_j:  # it might have more than one device
+
+
+                    st=Wen_min_[0]
+                    et=Wen_min_[1]
+
+                    for t in range(n_t):
+                        if st<T[t]:
+                            st_ind=t
+                            break
+                    et_ind=len(T)-1 # In case the end time is higher than the control horizon                  
+
+                    for t in range(n_t):
+                        if et<=T[t]:
+                            et_ind=t
+                            break 
+
+                    m.addConstr(gp.quicksum(delta_t[t]*pj[j,t] for t in range(st_ind+1,et_ind))+pj[j,st_ind]*(T[st_ind]-st)+pj[j,et_ind]*(et-T[et_ind-1])>=Wen_min_[2])
+
+                    
+                    
+        # ramping:
+        
+        ## start>>
+                    
+        #   # No shutting down at t=0 
+        # for j in range(n_j):
+        #     m.addConstr(j_on_0[j]<=j_on[j,0])             
+
+        
+        # ramping down constraints at t=0 (additional constraint)
+        # B_0=m.addVars(n_j,vtype=GRB.BINARY) 
+        for j in range(n_j):
+#             m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j,0])*GRB.INFINITY)
+            m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j,0])*pj0[j])
+            # M=3
+            # m.addConstr(j_on_0[j]>=j_on[j,0]-M*(1-j_sd[j,0]))
+            # m.addConstr(j_on_0[j]<=j_on[j,0]+M*j_sd[j,0]) 
+                    
+    
+        # ramping down constraints (additional constraint)
+        # B_=m.addVars(n_j,n_t,vtype=GRB.BINARY) 
+        for j in range(n_j):
+            for t in range(n_t-1):
+               m.addConstr(pj[j,t]<=pj_min_[j,t]+(1-j_sd[j,t+1])*(pj_max_[j,t]-pj_min_[j,t]))
+               # M=3
+               # m.addConstr(j_on[j,t]>=j_on[j,t+1]-M*(1-j_sd[j,t+1]))
+               # m.addConstr(j_on[j,t]<=j_on[j,t+1]+M*j_sd[j,t+1]) 
+        
+
+    
+        # Ramping Limits: (71)-(74)
+        ts=0     # ramp up
+        m.addConstrs(pj[j,ts]-pj0[j]<=delta_t[ts]*(pru[j]*(j_on[j,ts]-j_su[j,ts])+prusu[j]*(j_su[j,ts]+1-j_on[j,ts])) for j in range(n_j))        
+        m.addConstrs(pj[j,t]-pj[j,t-1]<=delta_t[t]*(pru[j]*(j_on[j,t]-j_su[j,t])+prusu[j]*(j_su[j,t]+1-j_on[j,t])) for j in range(n_j) for t in range(1,n_t))
+
+        ts=0      # ramp down
+        m.addConstrs(pj[j,ts]-pj0[j]>=-delta_t[ts]*(prd[j]*j_on[j,ts]+prdsd[j]*(1-j_on[j,ts])) for j in range(n_j))          
+        m.addConstrs(pj[j,t]-pj[j,t-1]>=-delta_t[t]*(prd[j]*j_on[j,t]+prdsd[j]*(1-j_on[j,t])) for j in range(n_j) for t in range(1,n_t) )     
+
+        
+        # no startup (temporary constraint)
+        #m.addConstrs( j_su[j,t]==0 for j in range(n_j) for t in range(n_t))
+
+        
+        ## end <<
+        
+        
+        
+                
+        obj=gp.quicksum(zen[j,t] for j in range (n_j) for t in range (n_t))-Zp-Zs-Zon-Zsu-Zsd
+
+        m.setObjective(obj, GRB.MAXIMIZE)
+        m.optimize()
+
+
+
+        stop = timeit.default_timer()
+        time0=stop - start
+        print('Time in mins- gurobi',time0/60)
+
+
+
+
+
+        #import winsound
+        #frequency = 500  # Set Frequency To 2500 Hertz
+        #duration = 1000  # Set Duration To 1000 ms == 1 second
+        #winsound.Beep(frequency, duration)    
+
+
+
+
+
+
+#         # End of MIP Model   
+#         # how many device change inital condiation
+
+#         j_on_x=[j_on[j,t].x for j in range (n_j) for t in range(1) ]
+
+#         tot=0
+#         for jj in range(n_j):
+#             tot=tot+abs(j_on_x[jj]-j_on_0[jj])
+#         print('device change inital condiation = ',tot)
+        
+        
+#         # how many device were/are on
+#         print('device were on = ', np.sum(j_on_0))
+#         print('device are on = ', np.sum(j_on_x))
+        
+
+       
+    
+#         count=0  # number of devices change their status during the operation
+#         j_on_x=[j_on[j,t].x for j in range (n_j) for t in range(n_t) ]
+       
+#         for j in range (n_j):
+#             if sum(j_on_x[n_t*(j):n_t*(j+1)])<n_t: # not alawys on
+#                 if sum(j_on_x[n_t*(j):n_t*(j+1)])>0: # not alawys off
+#                     count+=1
+#         print('number of devices change their status during the operation = ', count)
+  
+
+
+
+    
+    
+        # match with NLP code
+        j_on_=[np.round(j_on[j,t].x,0)  for t in range(n_t) for j in range(n_j)]
+        j_on=j_on_
+  
+
+
+
+#         device_Power_cost_=np.sum([zen[j,t].x for j in range (n_j) for t in range (n_t)])
+#         print('device_Power_cost_=',device_Power_cost_)
+#         ZON=Zon.x
+#         print('ZON-MILP-NLP=', ZON)
+#         ZSU= Zsu.x
+#         print('ZSU=',ZSU)
+#         ZSD=Zsd.x
+#         print('ZSD=',ZSD)
+#         print('Zp=',Zp)
+#         print('Zs=',Zs)
+        
+
+    
+    
+                
+    else:
+        # Model
+        m=gp.Model()
+        # m.params.presolve=0
+        # m.Params.FeasibilityTol = 1e-3
+        # IntFeasTol=1e-2
+        m.Params.MIPGap=0.01
+        # m.Params.TIME_LIMIT = 60*60*2
+
+        # m.Params.NoRelHeurTime=20 
+        # m.Params.Threads=1
+
+        # m.setParam("Method",3) #
+        # m.setParam("DegenMoves",0) 
+        # m.Params.MIPFocus=3
+
+        # Assign variables
+        theta = m.addVars(n_b, n_t, vtype='C', lb=-np.pi , ub=np.pi)
+        pje = m.addVars(n_je, vtype='C', lb=0 , ub=pje_max)
+
+        # Pj can be zero according to linear formulation. lb is pjmin in the quadratic formulation
+        # pj = m.addVars(n_j,n_t, vtype='C', lb=pj_min_ , ub=pj_max_) 
+        pj = m.addVars(n_j,n_t, vtype='C') 
+
+        j_on = m.addVars(n_j,lb=j_on_lb[:,0], ub=j_on_ub[:,0], vtype=GRB.BINARY) 
+
+        if L_S==1:
+            f_on_ = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+        else:
+            f_on_= np.transpose([f_on_0] * n_t)
+
+
+        # bounds on power
+        ub_=np.max(pj_max_)*n_j
+        lb_=-ub_
+        # ub_=GRB.INFINITY
+        # lb_=-GRB.INFINITY
+
+
+        # bus power (one_time usage)
+        P= m.addVars(n_b, n_t, vtype='C', lb=lb_, ub=ub_)      # Consuming(+)  Producing (-)
+        P_fr= m.addVars(n_b, n_t, vtype='C', lb=lb_ , ub=ub_)  # 
+        P_to= m.addVars(n_b, n_t, vtype='C', lb=lb_, ub=ub_)   # 
+        Pmis= m.addVars(n_b, n_t, vtype='C', lb=lb_ , ub=ub_ ) # 
+        Pmis_plus= m.addVars(n_b, n_t, vtype='C', lb=0  , ub=ub_) # 
+
+        # Shunt
+        # Ps= m.addVars(n_b, n_t, vtype='C', lb=0, ub=GRB.INFINITY) # 
+        # ush=m.addVars(n_s, vtype=GRB.INTEGER, lb=ush_min, ub=ush_max) #
+
+        # v= m.addVars(n_b, n_t, vtype='C', lb=v_min, ub=v_max) # 
+        # v2= m.addVars(n_b, n_t, vtype='C', lb=v_min2, ub=v_max2) # v2==v^2
+
+        # Branch
+        P_fr_f = m.addVars(n_f,n_t, vtype='C', lb=lb_ , ub=ub_) 
+        P_to_f = m.addVars(n_f,n_t, vtype='C', lb=lb_ , ub=ub_) 
+
+
+
+        # Branch Limits
+        s_plus= m.addVars(n_f,n_t,vtype='C', lb=0) # (128)
+
+        zen= m.addVars(n_j, n_t, vtype='C', lb=-GRB.INFINITY, ub=GRB.INFINITY) 
+
+
+
+
+        # Absolut value of power mismatch Constraints (4)-(7) (6 and 7 eliminated):
+
+        for i in range(n_b):
+            for t in range (n_t):
+                m.addConstr(Pmis_plus[i,t]>=Pmis[i,t],name='c0')
+                m.addConstr(Pmis_plus[i,t]>=-Pmis[i,t], name='c1')
+
+
+
+
+        # Power Balance Constraint (10):
+        # start:
+
+        for t in range (n_t):  
+            for i in range(n_b):
+
+                j_at_bus=bus_j_map[i]   # find the devices belongs to this bus       
+
+
+
+                # linear version:
+                m.addConstr(P[i,t]==gp.quicksum(pj[j,t]*j_sgn_[j] for j in j_at_bus), name='c2' )
+
+
+                #  P_fr
+                f_fr=fr_bus[i] # devices from bus that belongs to this bus
+                # P_fr[i,t]=0
+                for f in f_fr:
+                    if f not in dc_f:
+                        theta_index=fr_to[f]
+                        m.addConstr(P_fr_f[f,t]==Bf[f]*(theta[theta_index[0],t]-theta[theta_index[1],t]), name='c3')
+
+
+                        # Constraint (130): Branch flow limits
+                        # linear
+                        m.addConstr(P_fr_f[f,t]<=s_max[f]+s_plus[f,t])
+
+
+                m.addConstr(P_fr[i,t]==gp.quicksum(P_fr_f[f,t]*f_on_[f,t] for f in f_fr) )
+
+
+
+
+
+                #  P_to
+                f_to=to_bus[i]
+                # P_to[i,t]=0
+                for f in f_to:
+                    if f not in dc_f:
+                        theta_index=fr_to[f]
+                        m.addConstr(P_to_f[f,t]==-Bf[f]*(theta[theta_index[0],t]-theta[theta_index[1],t]), name='c5')
+
+
+
+                        # Constraint (131): Branch flow limits                
+                        # linear
+                        m.addConstr(P_to_f[f,t]<=s_max[f]+s_plus[f,t])
+
+
+                m.addConstr(P_to[i,t]==gp.quicksum(P_to_f[f,t]*f_on_[f,t] for f in f_to) )
+
+
+
+
+                # P_s
+                # shunts=bus_shunt_map[i] # shunts of the current bus
+
+                # m.addConstr(Ps[i,t]==gp.quicksum(gs[s]*ush[s]*v2[i,t] for s in shunts) , name='c8')
+                # m.addConstr(Ps[i,t]==gp.quicksum(gs[s]*ush[s] for s in shunts) , name='c8')
+
+
+
+        # with shunt power            
+        # m.addConstrs((P[i,t]+Ps[i,t]+P_fr[i,t]+P_to[i,t]==Pmis[i,t] for i in range(n_b) for t in range (n_t)), name='c9')
+
+        # no shunt power
+        m.addConstrs((P[i,t]+P_fr[i,t]+P_to[i,t]==Pmis[i,t] for i in range(n_b) for t in range (n_t)), name='c9')
+
+
+
+
+        # end of constraint (10)
+
+
+
+
+
+
+
+        # linear-version trick (slide 5) to remove the quadratic terms:
+
+        for j in range(n_j):
+            for t in range(n_t):
+                
+                if j_on_lb[j][t]<j_on_ub[j][t]:
+
+                    m.addConstr(pj[j,t]>=j_on[j]*pj_min_[j,t])
+                    m.addConstr(pj[j,t]<=j_on[j]*pj_max_[j,t])
+                    
+                else:
+                    m.addConstr(pj[j,t]>=j_on_ub[j][t]*pj_min_[j,t])
+                    m.addConstr(pj[j,t]<=j_on_ub[j][t]*pj_max_[j,t])
+
+
+        # # v2=v^2
+        # m.addConstrs((v2[i,t]==v[i,t]*v[i,t]   for i in range(n_b) for t in range (n_t)), name='c10')
+
+
+
+
+        # pj>=pj_min_: that is can be enforced by pj lower bound (lb=pj_min_) 
+        # Pj[j,t]=sum(pje)
+        for t in range(n_t):
+            for j in range (n_j):  
+
+                indexx=j_je[j,t] # find pje indices  of one device J at given time t
+
+                m.addConstr(pj[j,t]==gp.quicksum(pje[index] for index in indexx), name='c11')
+
+
+
+
+        # (142)-(146) 
+        # Dc line limits
+        for f in dc_f:
+            for t in range(n_t):
+
+                m.addConstr(P_fr_f[f,t]<=pdc_max_[f])   #(142)
+                m.addConstr(P_fr_f[f,t]>=-pdc_max_[f])
+
+                m.addConstr(P_to_f[f,t]<=pdc_max_[f])   #(144)
+                m.addConstr(P_to_f[f,t]>=-pdc_max_[f])
+
+                m.addConstr(P_fr_f[f,t]+P_to_f[f,t]==0)   #(146)
+
+
+
+
+
+        # on-off, startup, shoutdown
+        # (42) & (43)
+        j_su = m.addVars(n_j,vtype=GRB.BINARY)   
+        j_sd = m.addVars(n_j,vtype=GRB.BINARY) 
+
+        if L_S==1:
+            f_su = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+            f_sd = m.addVars(n_f,n_t,vtype=GRB.BINARY) 
+
+
+
+        # # (46)-(47)
+        for j in range (n_j):
+            t=0
+            m.addConstr(j_on[j]-j_on_0[j]==j_su[j]-j_sd[j])
+            #for t in range (1,n_t):
+            #    m.addConstr(j_on[j,t]-j_on[j,t-1]==j_su[j,t]-j_sd[j,t], name='p1')
+
+
+        if L_S==1:
+
+            for f in range (n_f):
+                t=0
+                m.addConstr(f_on_[f,t]-f_on_0[f]==f_su[f,t]-f_sd[f,t], name='p2')
+                for t in range (1,n_t):
+                    m.addConstr(f_on_[f,t]-f_on_[f,t-1]==f_su[f,t]-f_sd[f,t], name='p3')        
+
+
+        ## (48)
+        for t in range(n_t):
+            for j in range (n_j):
+                m.addConstr(j_su[j]+j_sd[j]<=1)
+
+        if L_S==1:
+            for t in range(n_t):
+                for f in range (n_f):
+                    m.addConstr(f_su[f,t]+f_sd[f,t]<=1)
+
+
+
+        # on-off startup shutdown costs
+        # (49),(50),(51)
+
+        Zon=m.addVar(vtype='C', lb=0) # Cost function        
+        m.addConstr(Zon==gp.quicksum(delta_t[t]*on_cost[j]*j_on[j] if j_on_lb[j][t]<j_on_ub[j][t] else delta_t[t]*on_cost[j]*j_on_ub[j][t]    for t in range(n_t) for j in range (n_j)   ))
+
+
+        Zsu=m.addVar(vtype='C', lb=0) # Cost function  
+        if L_S==1:      
+            m.addConstr(Zsu==gp.quicksum(su_cost[j]*j_su[j,t] for t in range(n_t) for j in range (n_j))+gp.quicksum(su_cost_f[f]*f_su[f,t] for t in range(n_t) for f in range (n_f)))
+        else:
+            m.addConstr(Zsu==gp.quicksum(su_cost[j]*j_su[j]  for j in range (n_j)))
+
+
+
+        Zsd=m.addVar(vtype='C', lb=0) # Cost function
+        if L_S==1:        
+            m.addConstr(Zsd==gp.quicksum(sd_cost[j]*j_sd[j,t] for t in range(n_t) for j in range (n_j))+gp.quicksum(sd_cost_f[f]*f_sd[f,t] for t in range(n_t) for f in range (n_f)))
+        else:
+            m.addConstr(Zsd==gp.quicksum(sd_cost[j]*j_sd[j]  for j in range (n_j)))
+
+
+
+
+#         # # (56)-(58):
+
+#         T=np.zeros(n_t)
+
+#         for t in range(n_t):
+
+#             if t>=1:
+#                 T[t]=T[t-1]+delta_t[t]
+#             else:
+#                 T[t]=delta_t[t]
+
+#         T=np.zeros(n_t_)
+
+#         for t in range(n_t_):
+
+#             if t>=1:
+#                 T[t]=T[t-1]+delta_t_[t]
+#             else:
+#                 T[t]=delta_t_[t]
+
+
+
+        # # (56)-(58):
+        T=np.zeros(n_t)
+
+        for t in range(n_t):
+
+            if t>=1:
+                T[t]=T[t-1]+delta_t_[t]
+            else:
+                T[t]=delta_t_[t]
+
+
+       
+
+
+
+
+         # # (57): Minimum uptime
+        for j in range(n_j):
+            up_time_=up_time[j]
+            if up_time_>0:
+                if j_on_0[j]==1:
+                    m.addConstr(j_on[j]==1)
+
+
+
+
+
+                        
+                        
+
+        # Costs & Objective
+
+        # zen=0  # producing & consuming
+        # tt=0
+        for j in range (n_j):
+            for t in range (n_t):
+                indexx=j_je[j,t]
+                m.addConstr(zen[j,t]==gp.quicksum(c_en[index]*pje[index]*delta_tj[index] for index in indexx), name='c12')
+
+
+
+
+
+
+        # (8) bus power violation/mismatch cost
+        cp=data['network']['violation_cost']['p_bus_vio_cost']
+        Zp=m.addVar(vtype='C', lb=0) # Cost function
+        m.addConstr(Zp==gp.quicksum(delta_t[t]*cp*Pmis_plus[i,t] for i in range (n_b) for t in range (n_t)))
+        # Zp=0
+
+        # (129) Branch limit penalty
+        cs=data['network']['violation_cost']['s_vio_cost']   
+        Zs=m.addVar(vtype='C', lb=0) # Cost function
+        m.addConstr(Zs==gp.quicksum(delta_t_[t]*cs*s_plus[f,t] for f in range (n_f) for t in range (n_t)))
+
+
+
+
+
+
+
+
+        # ## Section 2.6.3  Maximum/Minimum Energy Over intervals
+        # (68)-(69)
+        for j in range(n_j):
+
+            Wen_max_j=Wen_max[j]
+
+            if len(Wen_max_j)>0:
+
+                for Wen_max_ in Wen_max_j:  # it might have more than one device
+
+                    st=Wen_max_[0]
+                    et=Wen_max_[1]
+
+                    for t in range(n_t):
+                        if st<T[t]:
+                            st_ind=t
+                            break
+                    et_ind=len(T)-1 # In case the end time is higher than the control horizon                
+                    for t in range(n_t):
+                        if et<=T[t]:
+                            et_ind=t
+                            break        
+
+
+                    m.addConstr(gp.quicksum(delta_t[t]*pj[j,t] for t in range(st_ind+1,et_ind))+(T[st_ind]-st)*pj[j,st_ind]+(et-T[et_ind-1])*pj[j,et_ind]<=Wen_max_[2])
+
+
+            Wen_min_j=Wen_min[j]
+
+            if len(Wen_min_j)>0:
+                for Wen_min_ in Wen_min_j:  # it might have more than one device
+
+
+                    st=Wen_min_[0]
+                    et=Wen_min_[1]
+
+                    for t in range(n_t):
+                        if st<T[t]:
+                            st_ind=t
+                            break
+                    et_ind=len(T)-1 # In case the end time is higher than the control horizon                  
+
+                    for t in range(n_t):
+                        if et<=T[t]:
+                            et_ind=t
+                            break 
+
+                    m.addConstr(gp.quicksum(delta_t_[t]*pj[j,t] for t in range(st_ind+1,et_ind))+pj[j,st_ind]*(T[st_ind]-st)+pj[j,et_ind]*(et-T[et_ind-1])>=Wen_min_[2])
+                    
+        # ramping down constraints at t=0 (additional constraint)   
+        for j in range(n_j):
+            if pj_min_[j,0]>0:
+                m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j])*pj0[j])
+                
+        # # Ramping Limits: (71)-(74)
+        # ramp up
+        ts=0   
+#         m.addConstrs(pj[j,ts]-pj0[j]<=delta_t[ts]*(pru[j]*(j_on[j]-j_su[j])+prusu[j]*(j_su[j]+1-j_on[j]))  for j in range(n_j)) 
+            
+        # ramp down
+        for j in range(n_j):
+            if pj_min_[j,0]>0:
+                m.addConstr(pj[j,ts]-pj0[j]>=-delta_t[ts]*(prd[j]*j_on[j]+prdsd[j]*(1-j_on[j])))             
+        
+
+        # ramping down constraints at t=0 (additional constraint)   
+        for j in range(n_j):
+            if pj_min_[j,0]>0:
+                m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j])*pj0[j])
+                
+        # # Ramping Limits: (71)-(74)
+        # ramp up
+        ts=0   
+#         m.addConstrs(pj[j,ts]-pj0[j]<=delta_t[ts]*(pru[j]*(j_on[j]-j_su[j])+prusu[j]*(j_su[j]+1-j_on[j]))  for j in range(n_j)) 
+            
+        # ramp down
+        for j in range(n_j):
+            if pj_min_[j,0]>0:
+                m.addConstr(pj[j,ts]-pj0[j]>=-delta_t[ts]*(prd[j]*j_on[j]+prdsd[j]*(1-j_on[j])))               
+               
+           
+        
+            # m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j,0])*GRB.INFINITY)
+            # m.addConstr(float(pj0[j])<=pj_min_[j,0]+(1-j_sd[j,0])*pj_max_[j,0])
+
+#         # # Ramping Limits: (71)-(74)
+#         ts=0     # ramp up
+#         m.addConstrs(pj[j,ts]-pj0[j]<=delta_t[ts]*(pru[j]*(j_on[j]-j_su[j])+prusu[j]*(j_su[j]+1-j_on[j])) for j in range(n_j))        
+#         # ramp down
+#         m.addConstrs(pj[j,ts]-pj0[j]>=-delta_t[ts]*(prd[j]*j_on[j]+prdsd[j]*(1-j_on[j])) for j in range(n_j))   
+        
+
+        obj=gp.quicksum(zen[j,t] for j in range (n_j) for t in range (n_t))-Zp-Zs-Zon-Zsu-Zsd
+
+        m.setObjective(obj, GRB.MAXIMIZE)
+        m.optimize()
+
+
+
+        stop = timeit.default_timer()
+        time0=stop - start
+        print('Time in mins- gurobi',time0/60)
+
+
+
+
+
+        #import winsound
+        #frequency = 500  # Set Frequency To 2500 Hertz
+        #duration = 1000  # Set Duration To 1000 ms == 1 second
+        #winsound.Beep(frequency, duration)    
+
+
+
+
+
+
+        # End of MIP Model   
+
+        # >>
+        # match with NLP code  
+        # j_on=  [np.round(j_on[j].x,0)   for t in range(n_t) for j in range(n_j)]
+
+        
+        # must-run planned-outage condition
+        # n_t_=1 # temporary
+        
+        
+        if div>1 and (n_b==4224 or n_b==6049 or n_b==6708):
+            j_on_= np.array([[np.round(j_on[j].x,0) for j in range(n_j)]]*n_t_)
+            j_on_=j_on_.T
+
+            for j in range(n_j):
+
+                # check if device has must-run or planned-outage condiation
+                count=0
+                for t in range(n_t_):
+                    if j_on_lb[j,t]==j_on_ub[j,t]:
+                        count=count+1     
+                if count==0:
+                    continue
+
+                for t in range(n_t_):
+                    if j_on_lb[j,t]==j_on_ub[j,t]:
+                        j_on[j,t]=j_on_lb[j,t]
+                    else:
+                        if t==0:
+                            j_on_[j,t]=j_on_0[j]
+                        else:
+                            j_on_[j,t]=j_on_[j,t-1]
+
+            # match with NLP code        
+            j_on=[j_on_[j,t] for t in range(n_t_) for j in range(n_j)] 
+        else:
+           # match with NLP code        
+            j_on=  [np.round(j_on[j].x,0)   for t in range(n_t) for j in range(n_j)] 
+  
+        
+
+        
+        
+#         ZON=Zon.x
+#         ZSU= Zsu.x
+#         ZSD=Zsd.x        
+
+
+# start=0
+# shutdown=0
+# shutdown_j=[]
+# pj_min_j=[]
+# count=0
+# for j in range(n_j):
+#     if j_on[j]>j_on_0[j]:
+#         start=start+1
+#     if j_on[j]<j_on_0[j]: # shutdown
+#         shutdown=shutdown+1
+#         shutdown_j.append(j)
+#         pj_min_j.append(pj_min_[j,0])
+        
+        
+# print('number of devices start up',start)  
+# print('number of devices shut down',shutdown)          
+# print('....') 
+# print(shutdown_j)
+# print(pj_min_j)
+
+
+
+
+
+
+        
+# %%
+
+if div>1 and (n_b==4224 or n_b==6049 or n_b==6708):   # large Networs (4224/6049) divsion 2 & 3 # Seq_Ipopt
+    X={}
+    t=0
+    n_je_all=0   
+    n_je_tt={}    
+    j_t_je_map_all = {}
+    
+    vals2_all=[]
+    rows2_all=[]
+    cols2_all=[]
+    rows3_all = []
+    cols3_all = []   
+    
+    # pre-processing step - artifically change upper and lower bounds
+    p_max_new = np.zeros((n_j,n_t_))
+    p_min_new = np.zeros((n_j,n_t_))
+    for j2 in range(n_j):
+        # GAHHH ORDER NOT PRESETVED BETWEEN LISTS
+        uid = data['time_series_input']['simple_dispatchable_device'][j2]['uid']
+        j = j_map[uid]
+        for tt in range(n_t_):
+            p_max_new[j2,tt] = copy.deepcopy(data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][tt])
+            p_min_new[j2,tt] = copy.deepcopy(data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][tt])
+        #'''
+        for tt in np.arange(n_t_-2,-1,-1):
+            p_max_new[j2,tt] = min(p_max_new[j2,tt],p_max_new[j2,tt+1]+prd[j]*delta_t_[tt])
+            p_min_new[j2,tt] = max(p_min_new[j2,tt],p_min_new[j2,tt+1]-pru[j]*delta_t_[tt])
+
+        for tt in range(1,n_t_):
+            p_max_new[j2,tt] = min(p_max_new[j2,tt],p_max_new[j2,tt-1]+pru[j]*delta_t_[tt-1])
+            p_min_new[j2,tt] = max(p_min_new[j2,tt],p_min_new[j2,tt-1]-prd[j]*delta_t_[tt-1])
+
+        #'''
+    for tt in range(n_t_):        
+        
+        # Controllable load Version for NLP
+        
+        delta_tj=[]
+        c_en = []
+        n_je=0
+        j2_j = {}
+        pje_max=[]
+        
+        
+        je_i_map  = {}
+        je_t_map  = {}
+        je_j_map  = {}
+        j_t_je_map = {}
+        
+        
+        rows = [] # mapping for je to bus, time
+        cols = []
+        vals = []
+        rows2 = [] # mapping for j,t to bus, time
+        cols2 = []
+        
+
+        
+        vals2 = []
+        pje0 = []
+        delta_tj = []
+        
+        # for ramping constraints we will also need a matrix which maps je_to_j
+        rows3 = []
+        cols3 = []
+        
+
+        
+        # for fixed load factor
+        rows4 = []
+        cols4 = []
+        
+        # rows for bounded load factor
+        rows5 = []
+        cols5 = []
+        
+        pj_sdsu = np.zeros((n_b*n_t))
+        pjj_sdsu = np.zeros((n_j*n_t))
+        
+        bad_devices = []
+        for j2 in range(n_j):
+            # GAHHH ORDER NOT PRESETVED BETWEEN LISTS
+            uid = data['time_series_input']['simple_dispatchable_device'][j2]['uid']
+            j = j_map[uid]
+            j2_j[j] = j2
+            i = j_bus_map[j]
+            j_t_je_map[j] = {}
+            if tt==0:
+                j_t_je_map_all[j] = {}
+        
+            j_t_je_map[j][t] = []
+            j_t_je_map_all[j][tt] = []
+            
+            # > Old:
+            
+            # # If device is off constrain output to zero and don't create any n_je or have a ramp rate
+            
+            
+            # if j_on[j+t*n_j] == 0:
+            #     continue
+            
+            # if t == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 1: 
+            #     prup[j+t*n_j] = pru[j]*delta_t[t]
+            #     prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+            # elif t > 0 and j_on[j+(t-1)*n_j] == 1:
+            #     prup[j+t*n_j] = pru[j]*delta_t[t]
+            #     prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+                
+                
+            pmax = p_max_new[j2,tt]
+            pmin = p_min_new[j2,tt]
+            #pmax = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][tt]
+            #pmin = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][tt]
+            
+#             if n_t == 1:
+#                 pmax = min(data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'])
+#                 pmin = max(data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'])
+#                 pj_min[j+t*n_j] = pmin
+#                 pj_max[j+t*n_j] = pmax
+                
+#                 qj_max[j+t*n_j] = min(data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'])
+#                 qj_min[j+t*n_j] = max(data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'])
+#                 if qj_max[j+t*n_j] < qj_min[j+t*n_j]:
+#                     qj_max[j+t*n_j] = qj_min[j+t*n_j]
+#                 if pmin > pj0[j]+pru[j]*delta_t[0]:
+#                     pmin = pj0[j]+pru[j]*delta_t[0]
+#                     bad_devices.append(j)
+#                 if pmax < pj0[j]-prd[j]*delta_t[0]:
+#                     pmax = pj0[j]-prd[j]*delta_t[0]
+#                     bad_devices.append(j)
+#                 if pmin > pmax:
+#                     pmin = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][0]
+#                     pmax = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][0]
+#                     bad_devices.append(j)
+            # else:
+                # pj_min[j+t*n_j] = pmin
+                # pj_max[j+t*n_j] = pmax
+                # qj_max[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'][t]
+                # qj_min[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'][t]
+            pj_min[j+t*n_j] = pmin
+            pj_min_all[j+tt*n_j]=pmin
+            pj_max[j+t*n_j] = pmax
+            pj_max_all[j+tt*n_j] = pmax
+            
+            qj_max[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'][tt]
+            qj_min[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'][tt]                
+        
+        
+            # :
+            if j_on[j+tt*n_j] == 0:
+                if tt >= 1 and j_on[j+(tt-1)*n_j] == 0: 
+                    continue
+                if tt == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 0:
+                    continue
+            if tt == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 1 and j_on[j+tt*n_j] == 1:
+                prup[j+t*n_j] = pru[j]*delta_t_[tt]
+                prdn[j+t*n_j] = prd[j]*delta_t_[tt]*-1
+            elif tt > 0 and j_on[j+(tt-1)*n_j] == 1 and j_on[j+tt*n_j] == 1:
+                prup[j+t*n_j] = pru[j]*delta_t_[tt]
+                prdn[j+t*n_j] = prd[j]*delta_t_[tt]*-1
+            elif j_on[j+tt*n_j] == 1: # devices which are starting up
+                prup[j+t*n_j] = prusu[j]*delta_t_[tt]
+            else: # devices which are shutting down
+                t2 = 0
+                psd = pmin
+                while t2 < n_t_-tt and psd > 0:
+                    psd -= prdsd[j]*delta_t_[tt+t2]
+                    pj_sdsu[i+(t+t2)*n_b] += max(0,psd)*sign[uid]
+                    pjj_sdsu[j+(t+t2)*n_j] += max(0,psd)*sign[uid]
+                    t2 += 1
+                continue
+                    
+            if tt < n_t_-1:
+                if j_on[j+(tt+1)*n_j] == 0 and j_on[j+tt*n_j] == 1: # devices which are about to shut down
+                    pmax = pmin
+            if tt > 0:
+                if j_on[j+(tt-1)*n_j] == 0 and j_on[j+tt*n_j] == 1: # devices which have just turned on
+                    pmax = pmin
+            #else:
+            #    if j_on[j+t*n_j] == 1 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 0:
+            #        pmax = pmin
+        
+            
+            
+            
+            # Reserve costs
+            prgu_cost[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_reg_res_up_cost'][tt]
+            prgd_cost[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_reg_res_down_cost'][tt]
+            syn_cost[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_syn_res_cost'][tt]
+            nsyn_cost[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_nsyn_res_cost'][tt]
+            cru_on[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_up_online_cost'][tt]
+            cru_off[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_up_offline_cost'][tt]
+            crd_on[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_down_online_cost'][tt]
+            crd_off[j+tt*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_down_offline_cost'][tt]
+            
+            
+            rows2.append(i+n_b*t)
+            cols2.append(j+n_j*t)
+
+            rows2_all.append(i+n_b*tt)
+            cols2_all.append(j+n_j*tt)
+            
+            vals2.append(sign[uid])
+            vals2_all.append(sign[uid])
+            
+            j_sgn[j+n_j*t] = sign[uid]
+            
+            if j in qc_map:
+                qc = qc_map[j]
+                rows4.append(qc+n_qc*t)
+                cols4.append(j+n_j*t)
+            elif j in qb_map:
+                qb = qb_map[j]
+                rows5.append(qb+n_qb*t)
+                cols5.append(j+n_j*t)
+        
+            # First let's seperate out the uncontrollable generation or demand
+            #pl0[i+t*n_j] += pmin*sign[uid]
+            _p0 = copy.deepcopy(pj0[j])
+            # We are minimizing COST of generation, so cost should be positive, benefit should be negative
+            cost_blocks = [[float(b[0])*sign[uid],float(b[1])] for b in data['time_series_input']['simple_dispatchable_device'][j2]['cost'][tt]]
+        
+            cost_blocks = sorted(cost_blocks) # lowest cost / highest benefit first
+            #Load Bus 5 #1
+            #[[-108900.0, 0.0322], [-7508.0, 0.06449999999999999], [-3251.0, 0.1289], [-832.0, 0.09669999999999998], [-665.6, 1.2892000000000001]]
+            _p = 0
+            first = 1
+            for b in range(len(cost_blocks)):
+                if _p >= pmax:
+                    continue
+                if _p+cost_blocks[b][1] <= pmin: # skip if whole block uncontrollable
+                    _p += cost_blocks[b][1]
+                    continue
+                # _p is total load not including current block
+                # pmin is total uncontrollable load
+                # pmax is the total possible load (uncontrolled + controllable)
+                
+                # skip if we reach a block of zero size
+                if min(pmax-_p,cost_blocks[b][1])-first*(pmin-_p) < 1e-4:
+                    _p += cost_blocks[b][1]
+                    continue
+                
+                # if first is one then the current block includes some uncontrollable load (pmin-_p)
+                # what if the first block is ALSO the last block
+                
+                pje0.append(min(max(0,_p0-_p),cost_blocks[b][1]-first*(pmin-_p)))
+                pje_max.append(min(pmax-_p, # maximum load - summed load from previous blocks
+                                  cost_blocks[b][1])-first*(pmin-_p))
+                first = 0
+                
+                c_en.append(cost_blocks[b][0])
+                delta_tj.append(delta_t_[tt])
+                _p += cost_blocks[b][1]            
+        
+                je_i_map[n_je]  = i
+                je_j_map[n_je]  = j
+                je_t_map[n_je]  = t
+                j_t_je_map[j][t].append(n_je)
+                j_t_je_map_all[j][tt].append(n_je_all)
+                    
+                rows += [i+n_b*t]
+                cols += [n_je]
+                vals += [sign[uid]]
+                rows3 += [j+n_j*t]
+                cols3 += [n_je]
+                
+           
+                rows3_all += [j+n_j*tt]
+                cols3_all += [n_je_all]
+                
+                n_je += 1
+                n_je_all += 1
+        
+        
+        je_connected = coo_matrix((vals, (rows, cols)),shape=(n_b*n_t,n_je))
+        je_j = coo_matrix(([1.]*len(rows3), (rows3, cols3)),shape=(n_j*n_t,n_je))
+        
+        je_sgn = np.array(vals)
+        j_connected = coo_matrix((vals2, (rows2, cols2)), shape=(n_b*n_t,n_j*n_t))
+        qc_j = coo_matrix(([1.]*len(rows4), (rows4, cols4)), shape=(n_qc*n_t,n_j*n_t))
+        qb_j = coo_matrix(([1.]*len(rows5), (rows5, cols5)), shape=(n_qb*n_t,n_j*n_t))
+        pj_max = np.array(pj_max)
+        c_en = np.array(c_en)
+        delta_tj = np.array(delta_tj)
+        
+        n_je_tt[tt]=n_je
+        
+        
+        
+        
+        
+        
+        
+        # Jaciobian structure
+        r_idx = []
+        c_idx = []
+        #dp/dj
+        for je in range(n_je):
+            i = je_i_map[je]
+            t = je_t_map[je]
+            r_idx += [i+n_b*t]
+            c_idx += [n_b*n_t*2+je]
+        
+        #dq/dj
+        for t in range(n_t):
+            for j in range(n_j):
+                i = j_bus_map[j]
+                r_idx += [i+n_b*t+n_b*n_t]
+                c_idx += [n_b*n_t*2+n_je+j+n_j*t]
+            
+        #dpdv
+        r_idx += list(range(n_b*n_t))
+        c_idx += list(range(n_b*n_t))
+        
+        #dqdv
+        r_idx += list(range(n_b*n_t,n_b*n_t*2))
+        c_idx += list(range(n_b*n_t))
+            
+        #dpdt
+        r_idx += list(range(n_b*n_t))
+        c_idx += list(range(n_b*n_t,2*n_b*n_t)) 
+        
+        #dqdt
+        r_idx += list(range(n_b*n_t,n_b*n_t*2))
+        c_idx += list(range(n_b*n_t,2*n_b*n_t)) 
+        
+        
+        # cross branch terms
+        i1 = fo_connected.transpose().dot(np.array(range(n_b*n_t)))
+        i2 = fd_connected.transpose().dot(np.array(range(n_b*n_t)))
+        
+        
+        r_idx += (list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))*2
+        c_idx += (list(i2)+list(i1)+list(i2)+list(i1)+list(i2+n_b*n_t)+list(i1+n_b*n_t)
+                  +list(i2+n_b*n_t)+list(i1+n_b*n_t))
+        
+        # ramping constraint positive term
+        # To do -- We should be able to remove all but first/last term due to cancellation
+        n_jeT = 0
+        for j in range(n_j):
+            n_jeT += len(j_t_je_map[j][n_t-1])
+            for t in range(n_t):
+                for je in j_t_je_map[j][t]:
+                    r_idx += [n_b*n_t*2+j+n_j*t] 
+                    c_idx += [je+n_b*n_t*2]
+        
+        # negative term
+        for j in range(n_j):
+            for t in range(n_t-1):
+                for je in j_t_je_map[j][t]:
+                    r_idx += [n_b*n_t*2+j+n_j*(t+1)]
+                    c_idx += [je+n_b*n_t*2]
+                    
+        # ac branch constraints
+        if branch_lims is True:
+            r_idx += list(range(n_b*n_t*2+n_j*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t))*4
+            r_idx += list(range(n_b*n_t*2+n_j*n_t+n_f*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t*2))*4
+            c_idx += list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+            c_idx += list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+        
+        # dc branch
+        i1 = do_connected.transpose().dot(np.array(range(n_b*n_t)))
+        i2 = dd_connected.transpose().dot(np.array(range(n_b*n_t)))
+        # real power balance
+        r_idx += list(i1)+list(i2)
+        c_idx += list(range(2*n_b*n_t+n_je+n_j*n_t,2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t))*2
+        # reactive power balance
+        r_idx += list(i1+n_b*n_t)+list(i2+n_b*n_t)
+        c_idx += list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t,2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3))
+        
+        
+        
+                
+                
+        # qc devices 
+        beta_qc = []
+        rows = []
+        cols = []
+        for j in range(n_j):
+            if j not in qc_map:
+                continue
+            qc = qc_map[j]
+            for t in range(n_t):
+                for je in j_t_je_map[j][t]:
+                    r_idx += [n_b*n_t*2+n_j*n_t+qc+n_qc*t] 
+                    c_idx += [je+n_b*n_t*2] # p
+                    beta_qc.append(beta[qc])
+                rows += [n_b*n_t*2+n_j*n_t+qc+n_qc*t] 
+                cols += [n_je+n_b*n_t*2+j+n_j*t] # q
+        r_idx += rows
+        c_idx += cols
+        
+        # qb devices_lb
+        if q_bounds is True:
+            rows = []
+            cols = []
+            beta_qbl = []
+            for j in range(n_j):
+                if j not in qb_map:
+                    continue
+                qb = qb_map[j]
+                for t in range(n_t):
+                    for je in j_t_je_map[j][t]:
+                        r_idx += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*t]  # positive term
+                        c_idx += [je+n_b*n_t*2] # p
+                        beta_qbl.append(beta_min[qb])
+                    rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*t] 
+                    cols += [n_b*n_t*2+n_je+j+n_j*t] # q
+            r_idx += rows
+            c_idx += cols   
+        
+            rows = []
+            cols = []
+            beta_qbu = []
+            for j in range(n_j):
+                if j not in qb_map:
+                    continue
+                qb = qb_map[j]
+                for t in range(n_t):
+                    for je in j_t_je_map[j][t]:
+                        rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*(t+n_t)] # negative term
+                        cols += [n_b*n_t*2+je] # p
+                        beta_qbu.append(-1*beta_max[qb])
+                    rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*(t+n_t)]
+                    cols += [n_b*n_t*2+n_je+j+n_j*t] # q
+            r_idx += rows
+            c_idx += cols              
+            
+                
+        # Device energy
+        #for je in range(n_je):
+        #    j = je_j_map[je]
+        #    r_idx += [n_b*n_t*2+n_j*n_t+j]
+        #    c_idx += [n_b*n_t*2+n_j*n_t+je]
+            
+        # Hessian structure
+        r_idx2 = []
+        c_idx2 = []
+        #d2f/dv2
+        r_idx2 += list(range(n_b*n_t))
+        c_idx2 += list(range(n_b*n_t))
+        
+        # cross branch terms
+        i1 = fo_connected.transpose().dot(np.array(range(n_b*n_t)))
+        i2 = fd_connected.transpose().dot(np.array(range(n_b*n_t)))
+        
+        #d2f/dv1dt2
+        r_idx2 += list(i1)
+        c_idx2 += list(i2+n_b*n_t)
+        
+        #d2f/dv2dt1
+        r_idx2 += list(i2)
+        c_idx2 += list(i1+n_b*n_t)
+        
+        #d2f/dv2dv1
+        r_idx2 += list(i1)
+        c_idx2 += list(i2)
+        
+        #d2f/dt2dt1
+        r_idx2 += list(i1+n_b*n_t)
+        c_idx2 += list(i2+n_b*n_t)
+        
+        #d2f/dt2
+        r_idx2 += list(range(n_b*n_t,n_b*n_t*2))
+        c_idx2 += list(range(n_b*n_t,n_b*n_t*2))
+        
+        #d2f/dv1t1, d2f/dv2t2
+        r_idx2 += list(range(n_b*n_t,n_b*n_t*2))*2
+        c_idx2 += list(range(n_b*n_t))*2
+        
+        # AC branch constraints
+        if branch_lims is True:
+            r_idx2 += (list(i2+n_b*n_t)+list(i1+n_b*n_t)+list(i2)+list(i2+n_b*n_t)+list(i2+n_b*n_t)
+                       +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))
+            c_idx2 += (list(i1)+list(i2)+list(i1)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+                       +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1)+list(i2))
+            r_idx2 += (list(i2+n_b*n_t)+list(i1+n_b*n_t)+list(i2)+list(i2+n_b*n_t)+list(i2+n_b*n_t)
+                       +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))
+            c_idx2 += (list(i1)+list(i2)+list(i1)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+                       +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1)+list(i2))
+        
+        delta_tb = []
+        delta_tf = []
+        for t in range(n_t):
+            delta_tb += [delta_t_[tt]]*n_b
+            delta_tf += [delta_t_[tt]]*n_f
+        delta_tb = np.array(delta_tb)
+        delta_tf = np.array(delta_tf)
+        
+        recovery = False
+        #if n_b > 4000:
+        #    recovery = True # requires bus_slacks is True
+        
+        class acopf(object):
+            def __init__(self):
+                pass
+            
+            def objective(self,x):
+                #Format of decision variable will just be v1...vT theta1.. thetaT pj1... pjT qj1... qjT
+                v = x[:n_b*n_t] # v11... v21... vNbNt
+                theta = x[n_b*n_t:2*n_b*n_t]
+                pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+                qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+                p_slacksP = 0
+                p_slacksM = 0
+                q_slacksP = 0
+                q_slacksM = 0
+                sf_slacks = 0
+                if bus_slacks == True:
+                    p_slacksP = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                    p_slacksM = x[3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                    q_slacksP = x[4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                    q_slacksM = x[5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                if branch_slacks == True:
+                    sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+                
+                if recovery == True:
+                    if bus_slacks == True:
+                        return (sum(p_slacksP*delta_tb*pviol_cost)+sum(p_slacksM*delta_tb*pviol_cost)
+                                +sum(q_slacksP*delta_tb*qviol_cost)+sum(q_slacksM*delta_tb*qviol_cost))
+                    return 0.0
+                # objective is just device cost for now
+                # NOTE: ignoring delta_t for now
+                return (sum(c_en*pj*delta_tj)
+                        +sum(p_slacksP*delta_tb*pviol_cost)+sum(p_slacksM*delta_tb*pviol_cost)
+                        +sum(q_slacksP*delta_tb*qviol_cost)+sum(q_slacksM*delta_tb*qviol_cost)
+                        +sum(sf_slacks*delta_tf*sviol_cost))
+            
+            def gradient(self,x):
+                if recovery == True:
+                    if bus_slacks is False:
+                        return [0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+                    return ([0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+                            +list(pviol_cost*delta_tb)*2+list(qviol_cost*delta_tb)*2)
+                g = [0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+                if bus_slacks == True:
+                    g += list(pviol_cost*delta_tb)*2+list(qviol_cost*delta_tb)*2
+                if branch_slacks == True:
+                    g += list(sviol_cost*delta_tf)*2
+                return g
+            
+            def jacobian(self,x):
+                # FOR NOW JUST WITH POWER BALANCE TERMS
+                v = x[:n_b*n_t] # v11... v21... vNbNt
+                theta = x[n_b*n_t:2*n_b*n_t]
+                pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+                qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+                pdc = x[2*n_b*n_t+n_je+n_j*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t]
+                qdc_fr = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2]
+                qdc_to = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+                
+                vals = []
+                
+                # dp/dj
+                vals += list(je_sgn)
+                
+                # dq/dj
+                vals += list(j_on[(tt)*n_j:(tt+1)*n_j]*j_sgn)
+                # dpdv
+                dpdv = (-2*s_connected.dot(gs*ush0)*v 
+                        -2*fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))*v 
+                        -2*fd_connected.dot((gf+g_to)*f_on)*v)
+                # dpdt
+                dpdt = np.zeros((n_b*n_t,))
+                
+                # dqdv
+                dqdv = (2*s_connected.dot(bs*ush0)*v
+                        +2*fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))*v
+                        +2*fd_connected.dot(f_on*(bf+b_to+0.5*bfCH))*v)
+                
+                # dqdt
+                dqdt = np.zeros((n_b*n_t,))
+                
+                thetai = fo_connected.transpose().dot(theta)*f_on
+                thetaj = fd_connected.transpose().dot(theta)*f_on
+                vi = fo_connected.transpose().dot(v)*f_on
+                vj = fd_connected.transpose().dot(v)*f_on
+        
+                dpdv += fo_connected.dot((gf*np.cos(thetai-thetaj-thetaf)
+                                          +bf*np.sin(thetai-thetaj-thetaf))*vj/tauf)
+                dpdv += fd_connected.dot((gf*np.cos(thetaj-thetai+thetaf)
+                                          +bf*np.sin(thetaj-thetai+thetaf))*vi/tauf)  
+                dpdt += fo_connected.dot((-gf*np.sin(thetai-thetaj-thetaf)
+                                          +bf*np.cos(thetai-thetaj-thetaf))*vj*vi/tauf)
+                dpdt += fd_connected.dot((-gf*np.sin(thetaj-thetai+thetaf)
+                                          +bf*np.cos(thetaj-thetai+thetaf))*vi*vj/tauf)
+                dqdv += fo_connected.dot((-bf*np.cos(thetai-thetaj-thetaf)
+                                          +gf*np.sin(thetai-thetaj-thetaf))*vj/tauf)
+                dqdv += fd_connected.dot((-bf*np.cos(thetaj-thetai+thetaf)
+                                          +gf*np.sin(thetaj-thetai+thetaf))*vi/tauf) 
+                dqdt += fo_connected.dot((bf*np.sin(thetai-thetaj-thetaf)
+                                          +gf*np.cos(thetai-thetaj-thetaf))*vi*vj/tauf)
+                dqdt += fd_connected.dot((bf*np.sin(thetaj-thetai+thetaf)
+                                          +gf*np.cos(thetaj-thetai+thetaf))*vi*vj/tauf) 
+                
+                vals += list(dpdv)+list(dqdv)+list(dpdt)+list(dqdt)
+                
+                # cross branch terms
+                
+                vals += list((gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))*vi*f_on/tauf)
+                vals += list((gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))*vj*f_on/tauf)
+                vals += list((-bf*np.cos(thetai-thetaj-thetaf)+gf*np.sin(thetai-thetaj-thetaf))*vi*f_on/tauf)
+                vals += list((-bf*np.cos(thetaj-thetai+thetaf)+gf*np.sin(thetaj-thetai+thetaf))*vj*f_on/tauf)
+                vals += list((gf*np.sin(thetai-thetaj-thetaf)-bf*np.cos(thetai-thetaj-thetaf))*vi*vj*f_on/tauf)
+                vals += list((gf*np.sin(thetaj-thetai+thetaf)-bf*np.cos(thetaj-thetai+thetaf))*vi*vj*f_on/tauf)
+                vals += list((-bf*np.sin(thetai-thetaj-thetaf)-gf*np.cos(thetai-thetaj-thetaf))*vi*vj*f_on/tauf)
+                vals += list((-bf*np.sin(thetaj-thetai+thetaf)-gf*np.cos(thetaj-thetai+thetaf))*vi*vj*f_on/tauf)
+                
+                # device ramping
+                vals += [1.]*(n_je)
+                vals += [-1.]*(n_je-n_jeT)
+                
+                # branch limits
+                if branch_lims is True:
+                    pfo = f_on*((gf+g_fr)/(tauf*tauf)*vi*vi
+                                -vi*vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+        
+                    qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi*vi
+                                +vi*vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf)
+        
+                    pfd = f_on*((gf+g_to)*vj*vj
+                                -vi*vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+        
+                    qfd = f_on*(-(bf+b_to+0.5*bfCH)*vj*vj
+                                +vi*vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf)
+        
+                    dfcdvi = (2*pfo*f_on*(2*(gf+g_fr)/(tauf*tauf)*vi
+                                          -vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                              +2*qfo*f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi
+                                           +vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf))
+        
+                    dfcdvj = (2*pfo*f_on*(-vi*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                              +2*qfo*f_on*(vi*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf))
+        
+                    dfcdti = (2*pfo*f_on*(-vi*vj*(-gf*np.sin(thetai-thetaj-thetaf)+bf*np.cos(thetai-thetaj-thetaf))/tauf)
+                              +2*qfo*f_on*(vi*vj*(-bf*np.sin(thetai-thetaj-thetaf)-gf*np.cos(thetai-thetaj-thetaf))/tauf))
+        
+                    dfcdtj = -1*dfcdti
+        
+                    dfc2dvi = (2*pfd*f_on*(-vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                              +2*qfd*f_on*(vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf))
+        
+                    dfc2dvj = (2*pfd*f_on*(2*(gf+g_to)*vj
+                                           -vi*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                              +2*qfd*f_on*(-2*(bf+b_to+0.5*bfCH)*vj
+                                           +vi*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf))
+        
+                    dfc2dti = (2*pfd*f_on*(-vj*vi*(gf*np.sin(thetaj-thetai+thetaf)-bf*np.cos(thetaj-thetai+thetaf))/tauf)
+                              +2*qfd*f_on*(vj*vi*(bf*np.sin(thetaj-thetai+thetaf)+gf*np.cos(thetaj-thetai+thetaf))/tauf))
+        
+                    dfc2dtj = -1*dfc2dti
+        
+                    vals += (list(dfcdvi)+list(dfcdvj)+list(dfcdti)+list(dfcdtj)
+                             +list(dfc2dvi)+list(dfc2dvj)+list(dfc2dti)+list(dfc2dtj))
+                
+                
+                # dc branches
+                vals += [1.]*n_dc*n_t
+                vals += [-1.]*n_dc*n_t
+                vals += [1.]*(2*n_dc*n_t)
+                
+                
+                # q constant
+                vals += beta_qc
+                vals += list(qc_j.dot(j_on[(tt)*n_j:(tt+1)*n_j])*-1)
+                
+                # q bound
+                if q_bounds is True:
+                    vals += beta_qbl
+                    vals += list(qb_j.dot(j_on[(tt)*n_j:(tt+1)*n_j])*-1)
+                    vals += beta_qbu
+                    vals += list(qb_j.dot(j_on[(tt)*n_j:(tt+1)*n_j]))
+                
+                # device energy
+                
+                # slacks 
+                if bus_slacks == True:
+                    vals += [1.]*(n_b*n_t)+[-1.]*(n_b*n_t)+[1.]*(n_b*n_t)+[-1.]*(n_b*n_t)
+                if branch_slacks == True:
+                    vals += list(-2*sf_slacks-2*sf)*2
+                    
+                return vals 
+            
+            def jacobianstructure(self):
+                if bus_slacks is True and branch_slacks is True:
+                    return (r_idx+list(range(n_b*n_t))*2+list(range(n_b*n_t,n_b*n_t*2))*2
+                            +list(range(n_b*n_t*2+n_j*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t*2)),
+                            c_idx+list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3))
+                            +list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2)
+                elif bus_slacks is True:
+                    return (r_idx+list(range(n_b*n_t))*2+list(range(n_b*n_t,n_b*n_t*2))*2,
+                            c_idx+list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3)))
+                else:
+                    return (r_idx,c_idx)
+        
+            def hessian(self,x,lmbda,obj_weight):
+                v = x[:n_b*n_t] # v11... v21... vNbNt
+                theta = x[n_b*n_t:2*n_b*n_t]
+                pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+                qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+                
+                lmbda_p = np.array(lmbda[:n_b*n_t])
+                lmbda_q = np.array(lmbda[n_b*n_t:2*n_b*n_t])
+                lmbda_fc = np.array(lmbda[2*n_b*n_t+n_j*n_t:2*n_b*n_t+n_j*n_t+n_f*n_t])
+                lmbda_fc2 = np.array(lmbda[2*n_b*n_t+n_j*n_t+n_f*n_t:2*n_b*n_t+n_j*n_t+n_f*n_t*2])
+                    
+                vals = []
+                
+                # objective has no double derivatives - so don't think I need any terms
+                
+                # df/dv2
+                vals += list((-2*s_connected.dot(gs*ush0) 
+                              -2*fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))
+                              -2*fd_connected.dot((gf+g_to)*f_on))*lmbda_p
+                             +(2*s_connected.dot(bs*ush0)
+                              +2*fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))
+                              +2*fd_connected.dot(f_on*(bf+b_to+0.5*bfCH)))*lmbda_q)
+                
+                
+                
+                # branches
+                theta1 = fo_connected.transpose().dot(theta)
+                theta2 = fd_connected.transpose().dot(theta)
+                v1 = fo_connected.transpose().dot(v)
+                v2 = fd_connected.transpose().dot(v)
+                lp1 = fo_connected.transpose().dot(lmbda_p)
+                lp2 = fd_connected.transpose().dot(lmbda_p)
+                lq1 = fo_connected.transpose().dot(lmbda_q)
+                lq2 = fd_connected.transpose().dot(lmbda_q)
+        
+                #DV1T2
+                vals += list(((gf*np.sin(theta1-theta2-thetaf)-bf*np.cos(theta1-theta2-thetaf))*lp1
+                              +(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))*lp2
+                              -(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                              +(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))*lq2)*f_on*v2/tauf)
+        
+                #DV2T1
+                vals += list(((-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))*lp1
+                              +(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))*lp2
+                              +(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                              +(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))*lq2)*f_on*v1/tauf)
+        
+                #DV1V2
+                vals +=list(((gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))*lp1
+                            +(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))*lp2
+                            +(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))*lq1
+                            +(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))*lq2)*f_on/tauf)
+        
+                #DT1T2
+                vals +=list(((gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))*lp1
+                            +(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))*lp2
+                            +(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))*lq1
+                            +(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))*lq2)*v1*v2*f_on/tauf)
+                
+                #DT1T1, DT2T2
+                vals += list((fo_connected+fd_connected).dot((-(gf*np.cos(theta1-theta2-thetaf)
+                                                               +bf*np.sin(theta1-theta2-thetaf))*lp1
+                                                             -(gf*np.cos(theta2-theta1+thetaf)
+                                                               +bf*np.sin(theta2-theta1+thetaf))*lp2
+                                                             -(-bf*np.cos(theta1-theta2-thetaf)
+                                                               +gf*np.sin(theta1-theta2-thetaf))*lq1
+                                                             -(-bf*np.cos(theta2-theta1+thetaf)
+                                                               +gf*np.sin(theta2-theta1+thetaf))*lq2)*v1*v2*f_on/tauf))
+        
+                # DV1T1
+                vals += list(fo_connected.dot(((-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))*lp1
+                                               +(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))*lp2
+                                               +(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                                               +(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))*lq2)
+                                              *v2*f_on/tauf))
+        
+                # DV2T2
+                vals += list(fd_connected.dot(((gf*np.sin(theta1-theta2-thetaf)-bf*np.cos(theta1-theta2-thetaf))*lp1
+                                               +(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))*lp2
+                                               +(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))*lq1
+                                               +(+bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))*lq2)
+                                              *v1*f_on/tauf))
+                
+                
+                # AC Branch limits
+                if branch_lims is True:
+                    pfo = f_on*((gf+g_fr)/(tauf*tauf)*v1*v1
+                                -v1*v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*v1*v1
+                                +v1*v2*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    dpdv1 = f_on*(2*(gf+g_fr)/(tauf*tauf)*v1
+                                  -v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    dqdv1 = f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf)*v1
+                                  +v2*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    dpdv2 = f_on*(-v1*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    dqdv2 = f_on*(v1*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+        
+                    dpdt1 = f_on*(-v1*v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+        
+                    dqdt1 = f_on*(v1*v2*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+        
+                    dpdt2 = -1*dpdt1
+        
+                    dqdt2 = -1*dqdt1
+        
+                    #DV1THETA2
+                    dpfo2 = (2*pfo*f_on*(v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dpdv1*dpdt2)
+        
+                    dqfo2 = (2*qfo*f_on*(v2*(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dqdv1*dqdt2)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DV2DTHETA1
+                    dpfo2 = (2*pfo*f_on*(-v1*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dpdv2*dpdt1)
+        
+                    dqfo2 = (2*qfo*f_on*(v1*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dqdv2*dqdt1)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    # DV1DV2
+                    dpfo2 = (2*pfo*f_on*(-(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dpdv1*dpdv2)
+        
+                    dqfo2 = (2*qfo*f_on*((bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dqdv1*dqdv2)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DTHETA1THETA2
+                    dpfo2 = (2*pfo*f_on*(-v1*v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dpdt1*dpdt2)
+        
+                    dqfo2 = (2*qfo*f_on*(v1*v2*(bf*np.cos(theta1-theta2-thetaf) -gf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dqdt1*dqdt2)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DTHETA1THETA1 and 22
+                    dpfo2 = (2*pfo*f_on*(-v1*v2*(-gf*np.cos(theta1-theta2-thetaf) -bf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dpdt1*dpdt1)
+        
+                    dqfo2 = (2*qfo*f_on*(v1*v2*(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))/tauf)
+                             +2*dqdt1*dqdt1)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)*2
+        
+                    #DV1DV1
+                    dpfo2 = (2*pfo*f_on*(2*(gf+g_fr)/(tauf*tauf))+2*dpdv1*dpdv1)
+        
+                    dqfo2 = (2*qfo*f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf))+2*dqdv1*dqdv1)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DV2DV2 - TO DO!
+                    dpfo2 = 2*dpdv2*dpdv2*f_on
+        
+                    dqfo2 = 2*dqdv2*dqdv2*f_on
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DV1THETA1
+                    dpfo2 = (2*pfo*f_on*(-v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dpdv1*dpdt1)
+        
+                    dqfo2 = (2*qfo*f_on*(v2*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dqdv1*dqdt1)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    #DV2THETA2
+                    dpfo2 = (2*pfo*f_on*(v1*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dpdv2*dpdt2)
+        
+                    dqfo2 = (2*qfo*f_on*(v1*(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))/tauf)
+                             +2*dqdv2*dqdt2)
+        
+                    vals += list((dpfo2+dqfo2)*lmbda_fc)
+        
+                    pfd = f_on*((gf+g_to)*v2*v2
+                                -v1*v2*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    qfd = f_on*(-(bf+b_to+0.5*bfCH)*v2*v2
+                                +v1*v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    dpdv1 = f_on*(-v2*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    dqdv1 = f_on*(v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    dpdv2 = f_on*(2*(gf+g_to)*v2
+                                  -v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    dqdv2 = f_on*(-2*(bf+b_to+0.5*bfCH)*v2
+                                  +v1*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+        
+                    dpdt1 = f_on*(-v2*v1*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+        
+                    dqdt1 = f_on*(v2*v1*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+        
+                    dpdt2 = -1*dpdt1
+        
+                    dqdt2 = -1*dqdt1
+        
+                    #DV1THETA2
+                    dpfd2 = (2*pfd*f_on*(v2*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dpdv1*dpdt2)
+        
+                    dqfd2 = (2*qfd*f_on*(-v2*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dqdv1*dqdt2)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    #DV2DTHETA1
+                    dpfd2 = (2*pfd*f_on*(-v1*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dpdv2*dpdt1)
+        
+                    dqfd2 = (2*qfd*f_on*(v1*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dqdv2*dqdt1)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    # DV1DV2
+                    dpfd2 = (2*pfd*f_on*(-(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dpdv1*dpdv2)
+        
+                    dqfd2 = (2*qfd*f_on*((bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dqdv1*dqdv2)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    #DTHETA1THETA2
+                    dpfd2 = (2*pfd*f_on*(-v2*v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dpdt1*dpdt2)
+        
+                    dqfd2 = (2*qfd*f_on*(v1*v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dqdt1*dqdt2)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    #DTHETA1THETA1 and 22
+                    dpfd2 = (2*pfd*f_on*(v2*v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dpdt1*dpdt1)
+        
+                    dqfd2 = (2*qfd*f_on*(v1*v2*(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))/tauf)
+                             +2*dqdt1*dqdt1)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)*2
+        
+                    #DV1DV1
+                    dpfd2 = 2*dpdv1*dpdv1*f_on
+        
+                    dqfd2 = 2*dqdv1*dqdv1*f_on
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    #DV2DV2 - TO DO!
+                    dpfd2 = (2*pfd*f_on*2*(gf+g_to))+2*dpdv2*dpdv2
+        
+                    dqfd2 = (2*qfd*f_on*-2*(bf+b_to+0.5*bfCH))+2*dqdv2*dqdv2
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+                    # got to here
+        
+                    #DV1THETA1
+                    dpfd2 = (2*pfd*f_on*(-v2*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dpdv1*dpdt1)
+        
+                    dqfd2 = (2*qfd*f_on*(v2*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dqdv1*dqdt1)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+        
+                    #DV2THETA2
+                    dpfd2 = (2*pfd*f_on*(-v1*(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dpdv2*dpdt2)
+        
+                    dqfd2 = (2*qfd*f_on*(v1*(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))/tauf)
+                             +2*dqdv2*dqdt2)
+        
+                    vals += list((dpfd2+dqfd2)*lmbda_fc2)
+                
+                if branch_slacks is True:
+                    vals += list(-2*lmbda_fc)+list(-2*lmbda_fc2)
+                                             
+                return vals
+            
+            def hessianstructure(self):
+                if branch_slacks is True:
+                    return (r_idx2+list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2,
+                            c_idx2+list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2)
+                else:
+                    return (r_idx2,c_idx2)
+            
+            def constraints(self,x):
+                #print(x)
+                # FIRST: POWER BALANCE
+                v = x[:n_b*n_t] # v11... v21... vNbNt
+                theta = x[n_b*n_t:2*n_b*n_t]
+                pje = x[2*n_b*n_t:2*n_b*n_t+n_je]
+                qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+                pdc = x[2*n_b*n_t+n_je+n_j*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t]
+                qdc_fr = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2]
+                qdc_to = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                p_slacksP = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                p_slacksM = x[3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                q_slacksP = x[4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                q_slacksM = x[5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+        
+                # power balance constraint
+                pb = np.zeros((n_b*n_t,))
+                qb = np.zeros((n_b*n_t,))
+                
+                # devices
+                pb += je_connected.dot(pje)##je_on
+                pb += j_connected.dot(pj_min) # uncontrollable devices
+                pb += pj_sdsu # start up / shut down curves
+                qb += j_connected.dot(qj*j_on[(tt)*n_j:(tt+1)*n_j])
+                
+                # shunts - assuming fixed to initial position
+                pb -= s_connected.dot(gs*ush0)*v*v
+                qb += s_connected.dot(bs*ush0)*v*v
+                
+                # branches - group lines and transformers 
+                thetai = fo_connected.transpose().dot(theta)*f_on
+                thetaj = fd_connected.transpose().dot(theta)*f_on
+                vi = fo_connected.transpose().dot(v)*f_on
+                vj = fd_connected.transpose().dot(v)*f_on
+                
+                
+                # ac branch power balance
+                pb -= fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))*v*v
+                
+                pb -= fd_connected.dot((gf+g_to)*f_on)*v*v
+                pb += fo_connected.dot((gf*np.cos(thetai-thetaj-thetaf)
+                                        +bf*np.sin(thetai-thetaj-thetaf))*vi*vj/tauf)
+                pb += fd_connected.dot((gf*np.cos(thetaj-thetai+thetaf)
+                                        +bf*np.sin(thetaj-thetai+thetaf))*vi*vj/tauf)
+        
+                qb += fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))*v*v
+                qb += fd_connected.dot(f_on*(bf+b_to+0.5*bfCH))*v*v
+                qb += fo_connected.dot((-bf*np.cos(thetai-thetaj-thetaf)
+                                        +gf*np.sin(thetai-thetaj-thetaf))*vi*vj/tauf)
+                qb += fd_connected.dot((-bf*np.cos(thetaj-thetai+thetaf)
+                                        +gf*np.sin(thetaj-thetai+thetaf))*vi*vj/tauf)
+              
+            
+                # dc lines power balance
+                pb += do_connected.dot(pdc)
+                pb -= dd_connected.dot(pdc)
+                qb += do_connected.dot(qdc_fr)
+                qb += dd_connected.dot(qdc_to)
+                
+                # NEXT: DEVICE RAMPING - will need to remove for device switching (or can do in bounds?)
+                global pj
+                pj = je_j.dot(pje)+pj_min
+               
+                if tt==0:
+                    pj_ramp = pj-pj0 # diff
+                else:
+                    pj_ramp = pj-pj_old # diff
+                    
+                
+                
+                # Fixed power factor
+                qc = q0 + qc_j.dot(pj)*beta - qc_j.dot(qj*j_on[(tt)*n_j:(tt+1)*n_j])
+                
+                # Bounded power factor
+                qb_ub = qb_j.dot(qj*j_on[(tt)*n_j:(tt+1)*n_j]) - q0max - qb_j.dot(pj)*beta_max
+                qb_lb = q0min + qb_j.dot(pj)*beta_min - qb_j.dot(qj*j_on[(tt)*n_j:(tt+1)*n_j])
+                
+                # DEVICE ENERGY LIMITS
+                
+                # Branch limits
+                if branch_lims is True:
+                    pfo = f_on*((gf+g_fr)/(tauf*tauf)*vi*vi
+                                -vi*vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                    qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi*vi
+                                +vi*vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf)
+                    pfd = f_on*((gf+g_to)*vj*vj
+                                -vi*vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                    qfd = f_on*(-(bf+b_to+0.5*bfCH)*vj*vj
+                                +vi*vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf)
+                
+                
+                # FINALLY: SLACK VARIABLES (PROBABLY)
+                if bus_slacks is True:
+                    pb += p_slacksP-p_slacksM
+                    qb += q_slacksP-q_slacksM
+                    
+                if branch_slacks is True:
+                    fc = pfo*pfo+qfo*qfo-(sf+sf_slacks)*(sf+sf_slacks)
+                    fc2 = pfd*pfd+qfd*qfd-(sf+sf_slacks)*(sf+sf_slacks)
+                elif branch_lims is True:
+                    fc = pfo*pfo+qfo*qfo-(sf*sf)
+                    fc2 = pfd*pfd+qfd*qfd-(sf*sf)
+                else:
+                    return np.concatenate((pb,qb,pj_ramp,qc,qb_lb,qb_ub))
+                    
+                    
+                return np.concatenate((pb,qb,pj_ramp,qc,qb_lb,qb_ub,fc,fc2))
+        
+            
+        # HUGE REMINDER: PJ_min is the uncontrollable device output! The lower bounds on pj is zero for all je
+        if bus_slacks == True and branch_slacks == True:
+            x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                                 pdc0,qdc_fr0,qdc_to0,np.zeros(n_b*n_t*4+n_f*n_t)))
+            lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                                 pdc_max*-1,qdc_fr_min,qdc_to_min,
+                                 np.zeros(n_b*n_t*4+n_f*n_t)))
+            ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                                 pdc_max,qdc_fr_max,qdc_to_max,
+                                 np.array([2.]*(n_b*n_t*4)+[100.]*(n_f*n_t))))
+        elif bus_slacks == True:
+            x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                                 pdc0,qdc_fr0,qdc_to0,np.zeros(n_b*n_t*4)))
+            lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                                 pdc_max*-1,qdc_fr_min,qdc_to_min,
+                                 np.zeros(n_b*n_t*4)))
+            ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                                 pdc_max,qdc_fr_max,qdc_to_max,
+                                 np.array([2.]*(n_b*n_t*4))))
+        else:
+            x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                                 pdc0,qdc_fr0,qdc_to0))
+            lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                                 pdc_max*-1,qdc_fr_min,qdc_to_min))
+            ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                                 pdc_max,qdc_fr_max,qdc_to_max))
+        
+        #x0 = 0.5*(lb+ub)
+        for i in range(len(x0)):
+            #if ub[i] < lb[i]:
+            #    print(ub[i],x0[i],lb[i])
+            if ub[i] < x0[i]:
+                x0[i] = ub[i]
+            #    print(ub[i],x0[i],lb[i])
+            #if lb[i] > x0[i]:
+            #    print(ub[i],x0[i],lb[i])
+        
+        if branch_lims is True and q_bounds is True:
+            cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)+[None]*(n_qb*n_t*2+n_f*n_t*2)
+            cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t+n_qb*n_t*2+n_f*n_t*2)
+        elif q_bounds is True:
+            cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)+[None]*(n_qb*n_t*2)
+            cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t+n_qb*n_t*2)
+        else:
+            cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)
+            cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t)
+        
+        nlp = ipopt.problem(n=len(x0), m=len(cu), problem_obj=acopf(),
+         
+                            lb=lb, ub=ub, cl=cl, cu=cu)
+    
+    
+        
+    
+        '''
+        print('CONSTRAINTS')
+        print(n_b*n_t*2+len(prdn))
+        print(n_b*n_t*2+len(prdn)+n_qc*n_t)
+        print(n_b*n_t*2+len(prdn)+n_qc*n_t+n_qb*n_t)
+        print(n_b*n_t*2+len(prdn)+n_qc*n_t+n_qb*n_t*2)
+        print("VARS")
+        print(n_b*n_t*2)
+        print(n_b*n_t*2+n_je)
+        print(n_b*n_t*2+n_je+n_j*n_t)
+        #'''
+        
+        #nlp.addOption('derivative_test', 'first-order')
+        nlp.addOption("constr_viol_tol",1e-9)
+        nlp.addOption("dual_inf_tol",1e4)
+        nlp.addOption("compl_inf_tol",1e4)
+#         if div == 2:
+#             nlp.addOption("max_cpu_time",0.8*7200*10/n_t_)
+        nlp.addOption("print_level",0)
+        if n_b > 6000:
+            nlp.addOption("tol",1e-2)
+        else:
+            nlp.addOption("tol",1e-4)
+        
+        
+        for i in range(len(x0)):
+            if x0[i] > ub[i]:
+                x0[i] = ub[i]
+            if x0[i] < lb[i]:
+                x0[i] = lb[i]
+            if lb[i] > ub[i]:
+                print('Inconsistent bound: ',end='')
+                print(i)
+        
+        print('Timestep: '+str(tt))
+        t1 = time.time()
+        print('BUILD TIME TAKEN: '+str(t1-t0_))
+        t2 = time.time()
+        x, info = nlp.solve(x0)
+        t3 = time.time()
+        
+        print('SOLVER TIME TAKEN: '+str(t3-t2))
+        
+        # aggregate x
+        X[tt]=x
+#         pj_old=pj
+        pj_old=je_j.dot(x[2*n_b:2*n_b+n_je_tt[tt]])+pj_min
+        
+     
+    
+    
+else: # Normal Case: small Networks
+        
+        # Controllable load Version for NLP
+    
+    delta_tj=[]
+    c_en = []
+    n_je=0
+    j2_j = {}
+    pje_max=[]
+    
+    
+    je_i_map  = {}
+    je_t_map  = {}
+    je_j_map  = {}
+    j_t_je_map = {}
+    
+    
+    rows = [] # mapping for je to bus, time
+    cols = []
+    vals = []
+    rows2 = [] # mapping for j,t to bus, time
+    cols2 = []
+    vals2 = []
+    pje0 = []
+    delta_tj = []
+    
+    # for ramping constraints we will also need a matrix which maps je_to_j
+    rows3 = []
+    cols3 = []
+    
+    # for fixed load factor
+    rows4 = []
+    cols4 = []
+    
+    # rows for bounded load factor
+    rows5 = []
+    cols5 = []
+    
+    pj_sdsu = np.zeros((n_b*n_t))
+    pjj_sdsu = np.zeros((n_j*n_t))
+    
+    bad_devices = []
+    for j2 in range(n_j):
+        # GAHHH ORDER NOT PRESETVED BETWEEN LISTS
+        uid = data['time_series_input']['simple_dispatchable_device'][j2]['uid']
+        j = j_map[uid]
+        j2_j[j] = j2
+        i = j_bus_map[j]
+        j_t_je_map[j] = {}
+        
+        for t in range(n_t):
+            j_t_je_map[j][t] = []
+            
+            # > Old:
+            
+            # # If device is off constrain output to zero and don't create any n_je or have a ramp rate
+            
+            
+            # if j_on[j+t*n_j] == 0:
+            #     continue
+            
+            # if t == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 1: 
+            #     prup[j+t*n_j] = pru[j]*delta_t[t]
+            #     prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+            # elif t > 0 and j_on[j+(t-1)*n_j] == 1:
+            #     prup[j+t*n_j] = pru[j]*delta_t[t]
+            #     prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+                
+                
+            pmax = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][t]
+            pmin = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][t]
+            
+            if n_t == 1:
+                pmax = min(data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'])
+                pmin = max(data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'])
+                pj_min[j+t*n_j] = pmin
+                pj_max[j+t*n_j] = pmax
+                
+                qj_max[j+t*n_j] = min(data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'])
+                qj_min[j+t*n_j] = max(data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'])
+                if qj_max[j+t*n_j] < qj_min[j+t*n_j]:
+                    qj_max[j+t*n_j] = qj_min[j+t*n_j]
+                if pmin > pj0[j]+pru[j]*delta_t[0]:
+                    pmin = pj0[j]+pru[j]*delta_t[0]
+                    bad_devices.append(j)
+                if pmax < pj0[j]-prd[j]*delta_t[0]:
+                    pmax = pj0[j]-prd[j]*delta_t[0]
+                    bad_devices.append(j)
+                if pmin > pmax:
+                    pmin = data['time_series_input']['simple_dispatchable_device'][j2]['p_lb'][0]
+                    pmax = data['time_series_input']['simple_dispatchable_device'][j2]['p_ub'][0]
+                    bad_devices.append(j)
+                    
+            else:
+                pj_min[j+t*n_j] = pmin
+                pj_max[j+t*n_j] = pmax
+                qj_max[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_ub'][t]
+                qj_min[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['q_lb'][t]
+                    
+            
+            # > New:
+            if j_on[j+t*n_j] == 0:
+                if t >= 1 and j_on[j+(t-1)*n_j] == 0: 
+                    continue
+                if t == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 0:
+                    continue
+            if t == 0 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 1 and j_on[j+t*n_j] == 1:
+                prup[j+t*n_j] = pru[j]*delta_t[t]
+                prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+            elif t > 0 and j_on[j+(t-1)*n_j] == 1 and j_on[j+t*n_j] == 1:
+                prup[j+t*n_j] = pru[j]*delta_t[t]
+                prdn[j+t*n_j] = prd[j]*delta_t[t]*-1
+            elif j_on[j+t*n_j] == 1: # devices which are starting up
+                prup[j+t*n_j] = prusu[j]*delta_t[t]
+            else: # devices which are shutting down
+                t2 = 0
+                psd = pmin
+                while t2 < n_t-t and psd > 0:
+                    psd -= prdsd[j]*delta_t[t+t2]
+                    pj_sdsu[i+(t+t2)*n_b] += max(0,psd)*sign[uid]
+                    pjj_sdsu[j+(t+t2)*n_j] += max(0,psd)*sign[uid]
+                    t2 += 1
+                continue
+                    
+            if t < n_t-1:
+                if j_on[j+(t+1)*n_j] == 0 and j_on[j+t*n_j] == 1: # devices which are about to shut down
+                    pmax = pmin
+            if t > 0:
+                if j_on[j+(t-1)*n_j] == 0 and j_on[j+t*n_j] == 1: # devices which have just turned on
+                    pmax = pmin
+            #else:
+            #    if j_on[j+t*n_j] == 1 and data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 0:
+            #        pmax = pmin
+    
+            
+            
+            
+            # Reserve costs
+            prgu_cost[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_reg_res_up_cost'][t]
+            prgd_cost[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_reg_res_down_cost'][t]
+            syn_cost[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_syn_res_cost'][t]
+            nsyn_cost[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_nsyn_res_cost'][t]
+            
+            cru_on[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_up_online_cost'][t]
+            cru_off[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_up_offline_cost'][t]
+            crd_on[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_down_online_cost'][t]
+            crd_off[j+t*n_j] = data['time_series_input']['simple_dispatchable_device'][j2]['p_ramp_res_down_offline_cost'][t]
+            
+            rows2.append(i+n_b*t)
+            cols2.append(j+n_j*t)
+            vals2.append(sign[uid])
+            j_sgn[j+n_j*t] = sign[uid]
+            
+            if j in qc_map:
+                qc = qc_map[j]
+                rows4.append(qc+n_qc*t)
+                cols4.append(j+n_j*t)
+            elif j in qb_map:
+                qb = qb_map[j]
+                rows5.append(qb+n_qb*t)
+                cols5.append(j+n_j*t)
+    
+            # First let's seperate out the uncontrollable generation or demand
+            #pl0[i+t*n_j] += pmin*sign[uid]
+            _p0 = copy.deepcopy(pj0[j])
+            # We are minimizing COST of generation, so cost should be positive, benefit should be negative
+            cost_blocks = [[float(b[0])*sign[uid],float(b[1])] for b in data['time_series_input']['simple_dispatchable_device'][j2]['cost'][t]]
+    
+            cost_blocks = sorted(cost_blocks) # lowest cost / highest benefit first
+            #Load Bus 5 #1
+            #[[-108900.0, 0.0322], [-7508.0, 0.06449999999999999], [-3251.0, 0.1289], [-832.0, 0.09669999999999998], [-665.6, 1.2892000000000001]]
+            _p = 0
+            first = 1
+            for b in range(len(cost_blocks)):
+                if _p >= pmax:
+                    continue
+                if _p+cost_blocks[b][1] <= pmin: # skip if whole block uncontrollable
+                    _p += cost_blocks[b][1]
+                    continue
+                # _p is total load not including current block
+                # pmin is total uncontrollable load
+                # pmax is the total possible load (uncontrolled + controllable)
+                
+                # skip if we reach a block of zero size
+                if min(pmax-_p,cost_blocks[b][1])-first*(pmin-_p) < 1e-4:
+                    _p += cost_blocks[b][1]
+                    continue
+                
+                # if first is one then the current block includes some uncontrollable load (pmin-_p)
+                # what if the first block is ALSO the last block
+                
+                pje0.append(min(max(0,_p0-_p),cost_blocks[b][1]-first*(pmin-_p)))
+                pje_max.append(min(pmax-_p, # maximum load - summed load from previous blocks
+                                  cost_blocks[b][1])-first*(pmin-_p))
+                first = 0
+                
+                c_en.append(cost_blocks[b][0])
+                delta_tj.append(delta_t[t])
+                _p += cost_blocks[b][1]            
+    
+                je_i_map[n_je]  = i
+                je_j_map[n_je]  = j
+                je_t_map[n_je]  = t
+                j_t_je_map[j][t].append(n_je)
+                rows += [i+n_b*t]
+                cols += [n_je]
+                vals += [sign[uid]]
+                rows3 += [j+n_j*t]
+                cols3 += [n_je]
+                n_je += 1
+    
+    
+    je_connected = coo_matrix((vals, (rows, cols)),shape=(n_b*n_t,n_je))
+    je_j = coo_matrix(([1.]*len(rows3), (rows3, cols3)),shape=(n_j*n_t,n_je))
+    
+    je_sgn = np.array(vals)
+    j_connected = coo_matrix((vals2, (rows2, cols2)), shape=(n_b*n_t,n_j*n_t))
+    qc_j = coo_matrix(([1.]*len(rows4), (rows4, cols4)), shape=(n_qc*n_t,n_j*n_t))
+    qb_j = coo_matrix(([1.]*len(rows5), (rows5, cols5)), shape=(n_qb*n_t,n_j*n_t))
+    pj_max = np.array(pj_max)
+    c_en = np.array(c_en)
+    delta_tj = np.array(delta_tj)
+    
+    
+    
+    
+    
+    
+    
+    
+    # Jaciobian structure
+    r_idx = []
+    c_idx = []
+    #dp/dj
+    for je in range(n_je):
+        i = je_i_map[je]
+        t = je_t_map[je]
+        r_idx += [i+n_b*t]
+        c_idx += [n_b*n_t*2+je]
+    
+    #dq/dj
+    for t in range(n_t):
+        for j in range(n_j):
+            i = j_bus_map[j]
+            r_idx += [i+n_b*t+n_b*n_t]
+            c_idx += [n_b*n_t*2+n_je+j+n_j*t]
+        
+    #dpdv
+    r_idx += list(range(n_b*n_t))
+    c_idx += list(range(n_b*n_t))
+    
+    #dqdv
+    r_idx += list(range(n_b*n_t,n_b*n_t*2))
+    c_idx += list(range(n_b*n_t))
+        
+    #dpdt
+    r_idx += list(range(n_b*n_t))
+    c_idx += list(range(n_b*n_t,2*n_b*n_t)) 
+    
+    #dqdt
+    r_idx += list(range(n_b*n_t,n_b*n_t*2))
+    c_idx += list(range(n_b*n_t,2*n_b*n_t)) 
+    
+    
+    # cross branch terms
+    i1 = fo_connected.transpose().dot(np.array(range(n_b*n_t)))
+    i2 = fd_connected.transpose().dot(np.array(range(n_b*n_t)))
+    
+    
+    r_idx += (list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))*2
+    c_idx += (list(i2)+list(i1)+list(i2)+list(i1)+list(i2+n_b*n_t)+list(i1+n_b*n_t)
+              +list(i2+n_b*n_t)+list(i1+n_b*n_t))
+    
+    # ramping constraint positive term
+    # To do -- We should be able to remove all but first/last term due to cancellation
+    n_jeT = 0
+    for j in range(n_j):
+        n_jeT += len(j_t_je_map[j][n_t-1])
+        for t in range(n_t):
+            for je in j_t_je_map[j][t]:
+                r_idx += [n_b*n_t*2+j+n_j*t] 
+                c_idx += [je+n_b*n_t*2]
+    
+    # negative term
+    for j in range(n_j):
+        for t in range(n_t-1):
+            for je in j_t_je_map[j][t]:
+                r_idx += [n_b*n_t*2+j+n_j*(t+1)]
+                c_idx += [je+n_b*n_t*2]
+                
+    # ac branch constraints
+    if branch_lims is True:
+        r_idx += list(range(n_b*n_t*2+n_j*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t))*4
+        r_idx += list(range(n_b*n_t*2+n_j*n_t+n_f*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t*2))*4
+        c_idx += list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+        c_idx += list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+    
+    # dc branch
+    i1 = do_connected.transpose().dot(np.array(range(n_b*n_t)))
+    i2 = dd_connected.transpose().dot(np.array(range(n_b*n_t)))
+    # real power balance
+    r_idx += list(i1)+list(i2)
+    c_idx += list(range(2*n_b*n_t+n_je+n_j*n_t,2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t))*2
+    # reactive power balance
+    r_idx += list(i1+n_b*n_t)+list(i2+n_b*n_t)
+    c_idx += list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t,2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3))
+    
+    
+    
+            
+            
+    # qc devices 
+    beta_qc = []
+    rows = []
+    cols = []
+    for j in range(n_j):
+        if j not in qc_map:
+            continue
+        qc = qc_map[j]
+        for t in range(n_t):
+            for je in j_t_je_map[j][t]:
+                r_idx += [n_b*n_t*2+n_j*n_t+qc+n_qc*t] 
+                c_idx += [je+n_b*n_t*2] # p
+                beta_qc.append(beta[qc])
+            rows += [n_b*n_t*2+n_j*n_t+qc+n_qc*t] 
+            cols += [n_je+n_b*n_t*2+j+n_j*t] # q
+    r_idx += rows
+    c_idx += cols
+    
+    # qb devices_lb
+    if q_bounds is True:
+        rows = []
+        cols = []
+        beta_qbl = []
+        for j in range(n_j):
+            if j not in qb_map:
+                continue
+            qb = qb_map[j]
+            for t in range(n_t):
+                for je in j_t_je_map[j][t]:
+                    r_idx += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*t]  # positive term
+                    c_idx += [je+n_b*n_t*2] # p
+                    beta_qbl.append(beta_min[qb])
+                rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*t] 
+                cols += [n_b*n_t*2+n_je+j+n_j*t] # q
+        r_idx += rows
+        c_idx += cols   
+    
+        rows = []
+        cols = []
+        beta_qbu = []
+        for j in range(n_j):
+            if j not in qb_map:
+                continue
+            qb = qb_map[j]
+            for t in range(n_t):
+                for je in j_t_je_map[j][t]:
+                    rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*(t+n_t)] # negative term
+                    cols += [n_b*n_t*2+je] # p
+                    beta_qbu.append(-1*beta_max[qb])
+                rows += [n_b*n_t*2+n_j*n_t+n_qc*n_t+qb+n_qb*(t+n_t)]
+                cols += [n_b*n_t*2+n_je+j+n_j*t] # q
+        r_idx += rows
+        c_idx += cols              
+        
+            
+    # Device energy
+    #for je in range(n_je):
+    #    j = je_j_map[je]
+    #    r_idx += [n_b*n_t*2+n_j*n_t+j]
+    #    c_idx += [n_b*n_t*2+n_j*n_t+je]
+        
+    # Hessian structure
+    r_idx2 = []
+    c_idx2 = []
+    #d2f/dv2
+    r_idx2 += list(range(n_b*n_t))
+    c_idx2 += list(range(n_b*n_t))
+    
+    # cross branch terms
+    i1 = fo_connected.transpose().dot(np.array(range(n_b*n_t)))
+    i2 = fd_connected.transpose().dot(np.array(range(n_b*n_t)))
+    
+    #d2f/dv1dt2
+    r_idx2 += list(i1)
+    c_idx2 += list(i2+n_b*n_t)
+    
+    #d2f/dv2dt1
+    r_idx2 += list(i2)
+    c_idx2 += list(i1+n_b*n_t)
+    
+    #d2f/dv2dv1
+    r_idx2 += list(i1)
+    c_idx2 += list(i2)
+    
+    #d2f/dt2dt1
+    r_idx2 += list(i1+n_b*n_t)
+    c_idx2 += list(i2+n_b*n_t)
+    
+    #d2f/dt2
+    r_idx2 += list(range(n_b*n_t,n_b*n_t*2))
+    c_idx2 += list(range(n_b*n_t,n_b*n_t*2))
+    
+    #d2f/dv1t1, d2f/dv2t2
+    r_idx2 += list(range(n_b*n_t,n_b*n_t*2))*2
+    c_idx2 += list(range(n_b*n_t))*2
+    
+    # AC branch constraints
+    if branch_lims is True:
+        r_idx2 += (list(i2+n_b*n_t)+list(i1+n_b*n_t)+list(i2)+list(i2+n_b*n_t)+list(i2+n_b*n_t)
+                   +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))
+        c_idx2 += (list(i1)+list(i2)+list(i1)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+                   +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1)+list(i2))
+        r_idx2 += (list(i2+n_b*n_t)+list(i1+n_b*n_t)+list(i2)+list(i2+n_b*n_t)+list(i2+n_b*n_t)
+                   +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1+n_b*n_t)+list(i2+n_b*n_t))
+        c_idx2 += (list(i1)+list(i2)+list(i1)+list(i1+n_b*n_t)+list(i2+n_b*n_t)
+                   +list(i1+n_b*n_t)+list(i1)+list(i2)+list(i1)+list(i2))
+    
+    delta_tb = []
+    delta_tf = []
+    for t in range(n_t):
+        delta_tb += [delta_t[t]]*n_b
+        delta_tf += [delta_t[t]]*n_f
+    delta_tb = np.array(delta_tb)
+    delta_tf = np.array(delta_tf)
+    
+    recovery = False
+    #if n_b > 4000:
+    #    recovery = True # requires bus_slacks is True
+    
+    class acopf(object):
+        def __init__(self):
+            pass
+        
+        def objective(self,x):
+            #Format of decision variable will just be v1...vT theta1.. thetaT pj1... pjT qj1... qjT
+            v = x[:n_b*n_t] # v11... v21... vNbNt
+            theta = x[n_b*n_t:2*n_b*n_t]
+            pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+            qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+            p_slacksP = 0
+            p_slacksM = 0
+            q_slacksP = 0
+            q_slacksM = 0
+            sf_slacks = 0
+            if bus_slacks == True:
+                p_slacksP = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                p_slacksM = x[3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                q_slacksP = x[4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+                q_slacksM = x[5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            if branch_slacks == True:
+                sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+            
+            if recovery == True:
+                if bus_slacks == True:
+                    return (sum(p_slacksP*delta_tb*pviol_cost)+sum(p_slacksM*delta_tb*pviol_cost)
+                            +sum(q_slacksP*delta_tb*qviol_cost)+sum(q_slacksM*delta_tb*qviol_cost))
+                return 0.0
+            # objective is just device cost for now
+            # NOTE: ignoring delta_t for now
+            return (sum(c_en*pj*delta_tj)
+                    +sum(p_slacksP*delta_tb*pviol_cost)+sum(p_slacksM*delta_tb*pviol_cost)
+                    +sum(q_slacksP*delta_tb*qviol_cost)+sum(q_slacksM*delta_tb*qviol_cost)
+                    +sum(sf_slacks*delta_tf*sviol_cost))
+        
+        def gradient(self,x):
+            if recovery == True:
+                if bus_slacks is False:
+                    return [0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+                return ([0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+                        +list(pviol_cost*delta_tb)*2+list(qviol_cost*delta_tb)*2)
+            g = [0.0]*(2*n_b*n_t)+list(c_en*delta_tj)+[0.]*(n_j*n_t+3*n_dc*n_t)
+            if bus_slacks == True:
+                g += list(pviol_cost*delta_tb)*2+list(qviol_cost*delta_tb)*2
+            if branch_slacks == True:
+                g += list(sviol_cost*delta_tf)*2
+            return g
+        
+        def jacobian(self,x):
+            # FOR NOW JUST WITH POWER BALANCE TERMS
+            v = x[:n_b*n_t] # v11... v21... vNbNt
+            theta = x[n_b*n_t:2*n_b*n_t]
+            pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+            qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+            pdc = x[2*n_b*n_t+n_je+n_j*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t]
+            qdc_fr = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2]
+            qdc_to = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+            
+            vals = []
+            
+            # dp/dj
+            vals += list(je_sgn)
+            
+            # dq/dj
+            vals += list(j_on*j_sgn)
+            # dpdv
+            dpdv = (-2*s_connected.dot(gs*ush0)*v 
+                    -2*fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))*v 
+                    -2*fd_connected.dot((gf+g_to)*f_on)*v)
+            # dpdt
+            dpdt = np.zeros((n_b*n_t,))
+            
+            # dqdv
+            dqdv = (2*s_connected.dot(bs*ush0)*v
+                    +2*fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))*v
+                    +2*fd_connected.dot(f_on*(bf+b_to+0.5*bfCH))*v)
+            
+            # dqdt
+            dqdt = np.zeros((n_b*n_t,))
+            
+            thetai = fo_connected.transpose().dot(theta)*f_on
+            thetaj = fd_connected.transpose().dot(theta)*f_on
+            vi = fo_connected.transpose().dot(v)*f_on
+            vj = fd_connected.transpose().dot(v)*f_on
+    
+            dpdv += fo_connected.dot((gf*np.cos(thetai-thetaj-thetaf)
+                                      +bf*np.sin(thetai-thetaj-thetaf))*vj/tauf)
+            dpdv += fd_connected.dot((gf*np.cos(thetaj-thetai+thetaf)
+                                      +bf*np.sin(thetaj-thetai+thetaf))*vi/tauf)  
+            dpdt += fo_connected.dot((-gf*np.sin(thetai-thetaj-thetaf)
+                                      +bf*np.cos(thetai-thetaj-thetaf))*vj*vi/tauf)
+            dpdt += fd_connected.dot((-gf*np.sin(thetaj-thetai+thetaf)
+                                      +bf*np.cos(thetaj-thetai+thetaf))*vi*vj/tauf)
+            dqdv += fo_connected.dot((-bf*np.cos(thetai-thetaj-thetaf)
+                                      +gf*np.sin(thetai-thetaj-thetaf))*vj/tauf)
+            dqdv += fd_connected.dot((-bf*np.cos(thetaj-thetai+thetaf)
+                                      +gf*np.sin(thetaj-thetai+thetaf))*vi/tauf) 
+            dqdt += fo_connected.dot((bf*np.sin(thetai-thetaj-thetaf)
+                                      +gf*np.cos(thetai-thetaj-thetaf))*vi*vj/tauf)
+            dqdt += fd_connected.dot((bf*np.sin(thetaj-thetai+thetaf)
+                                      +gf*np.cos(thetaj-thetai+thetaf))*vi*vj/tauf) 
+            
+            vals += list(dpdv)+list(dqdv)+list(dpdt)+list(dqdt)
+            
+            # cross branch terms
+            
+            vals += list((gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))*vi*f_on/tauf)
+            vals += list((gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))*vj*f_on/tauf)
+            vals += list((-bf*np.cos(thetai-thetaj-thetaf)+gf*np.sin(thetai-thetaj-thetaf))*vi*f_on/tauf)
+            vals += list((-bf*np.cos(thetaj-thetai+thetaf)+gf*np.sin(thetaj-thetai+thetaf))*vj*f_on/tauf)
+            vals += list((gf*np.sin(thetai-thetaj-thetaf)-bf*np.cos(thetai-thetaj-thetaf))*vi*vj*f_on/tauf)
+            vals += list((gf*np.sin(thetaj-thetai+thetaf)-bf*np.cos(thetaj-thetai+thetaf))*vi*vj*f_on/tauf)
+            vals += list((-bf*np.sin(thetai-thetaj-thetaf)-gf*np.cos(thetai-thetaj-thetaf))*vi*vj*f_on/tauf)
+            vals += list((-bf*np.sin(thetaj-thetai+thetaf)-gf*np.cos(thetaj-thetai+thetaf))*vi*vj*f_on/tauf)
+            
+            # device ramping
+            vals += [1.]*(n_je)
+            vals += [-1.]*(n_je-n_jeT)
+            
+            # branch limits
+            if branch_lims is True:
+                pfo = f_on*((gf+g_fr)/(tauf*tauf)*vi*vi
+                            -vi*vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+    
+                qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi*vi
+                            +vi*vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf)
+    
+                pfd = f_on*((gf+g_to)*vj*vj
+                            -vi*vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+    
+                qfd = f_on*(-(bf+b_to+0.5*bfCH)*vj*vj
+                            +vi*vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf)
+    
+                dfcdvi = (2*pfo*f_on*(2*(gf+g_fr)/(tauf*tauf)*vi
+                                      -vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                          +2*qfo*f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi
+                                       +vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf))
+    
+                dfcdvj = (2*pfo*f_on*(-vi*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                          +2*qfo*f_on*(vi*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf))
+    
+                dfcdti = (2*pfo*f_on*(-vi*vj*(-gf*np.sin(thetai-thetaj-thetaf)+bf*np.cos(thetai-thetaj-thetaf))/tauf)
+                          +2*qfo*f_on*(vi*vj*(-bf*np.sin(thetai-thetaj-thetaf)-gf*np.cos(thetai-thetaj-thetaf))/tauf))
+    
+                dfcdtj = -1*dfcdti
+    
+                dfc2dvi = (2*pfd*f_on*(-vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                          +2*qfd*f_on*(vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf))
+    
+                dfc2dvj = (2*pfd*f_on*(2*(gf+g_to)*vj
+                                       -vi*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                          +2*qfd*f_on*(-2*(bf+b_to+0.5*bfCH)*vj
+                                       +vi*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf))
+    
+                dfc2dti = (2*pfd*f_on*(-vj*vi*(gf*np.sin(thetaj-thetai+thetaf)-bf*np.cos(thetaj-thetai+thetaf))/tauf)
+                          +2*qfd*f_on*(vj*vi*(bf*np.sin(thetaj-thetai+thetaf)+gf*np.cos(thetaj-thetai+thetaf))/tauf))
+    
+                dfc2dtj = -1*dfc2dti
+    
+                vals += (list(dfcdvi)+list(dfcdvj)+list(dfcdti)+list(dfcdtj)
+                         +list(dfc2dvi)+list(dfc2dvj)+list(dfc2dti)+list(dfc2dtj))
+            
+            
+            # dc branches
+            vals += [1.]*n_dc*n_t
+            vals += [-1.]*n_dc*n_t
+            vals += [1.]*(2*n_dc*n_t)
+            
+            
+            # q constant
+            vals += beta_qc
+            vals += list(qc_j.dot(j_on)*-1)
+            
+            # q bound
+            if q_bounds is True:
+                vals += beta_qbl
+                vals += list(qb_j.dot(j_on)*-1)
+                vals += beta_qbu
+                vals += list(qb_j.dot(j_on))
+            
+            # device energy
+            
+            # slacks 
+            if bus_slacks == True:
+                vals += [1.]*(n_b*n_t)+[-1.]*(n_b*n_t)+[1.]*(n_b*n_t)+[-1.]*(n_b*n_t)
+            if branch_slacks == True:
+                vals += list(-2*sf_slacks-2*sf)*2
+                
+            return vals 
+        
+        def jacobianstructure(self):
+            if bus_slacks is True and branch_slacks is True:
+                return (r_idx+list(range(n_b*n_t))*2+list(range(n_b*n_t,n_b*n_t*2))*2
+                        +list(range(n_b*n_t*2+n_j*n_t,n_b*n_t*2+n_j*n_t+n_f*n_t*2)),
+                        c_idx+list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3))
+                        +list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2)
+            elif bus_slacks is True:
+                return (r_idx+list(range(n_b*n_t))*2+list(range(n_b*n_t,n_b*n_t*2))*2,
+                        c_idx+list(range(2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3)))
+            else:
+                return (r_idx,c_idx)
+    
+        def hessian(self,x,lmbda,obj_weight):
+            v = x[:n_b*n_t] # v11... v21... vNbNt
+            theta = x[n_b*n_t:2*n_b*n_t]
+            pj = x[2*n_b*n_t:2*n_b*n_t+n_je]
+            qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+            
+            lmbda_p = np.array(lmbda[:n_b*n_t])
+            lmbda_q = np.array(lmbda[n_b*n_t:2*n_b*n_t])
+            lmbda_fc = np.array(lmbda[2*n_b*n_t+n_j*n_t:2*n_b*n_t+n_j*n_t+n_f*n_t])
+            lmbda_fc2 = np.array(lmbda[2*n_b*n_t+n_j*n_t+n_f*n_t:2*n_b*n_t+n_j*n_t+n_f*n_t*2])
+                
+            vals = []
+            
+            # objective has no double derivatives - so don't think I need any terms
+            
+            # df/dv2
+            vals += list((-2*s_connected.dot(gs*ush0) 
+                          -2*fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))
+                          -2*fd_connected.dot((gf+g_to)*f_on))*lmbda_p
+                         +(2*s_connected.dot(bs*ush0)
+                          +2*fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))
+                          +2*fd_connected.dot(f_on*(bf+b_to+0.5*bfCH)))*lmbda_q)
+            
+            
+            
+            # branches
+            theta1 = fo_connected.transpose().dot(theta)
+            theta2 = fd_connected.transpose().dot(theta)
+            v1 = fo_connected.transpose().dot(v)
+            v2 = fd_connected.transpose().dot(v)
+            lp1 = fo_connected.transpose().dot(lmbda_p)
+            lp2 = fd_connected.transpose().dot(lmbda_p)
+            lq1 = fo_connected.transpose().dot(lmbda_q)
+            lq2 = fd_connected.transpose().dot(lmbda_q)
+    
+            #DV1T2
+            vals += list(((gf*np.sin(theta1-theta2-thetaf)-bf*np.cos(theta1-theta2-thetaf))*lp1
+                          +(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))*lp2
+                          -(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                          +(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))*lq2)*f_on*v2/tauf)
+    
+            #DV2T1
+            vals += list(((-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))*lp1
+                          +(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))*lp2
+                          +(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                          +(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))*lq2)*f_on*v1/tauf)
+    
+            #DV1V2
+            vals +=list(((gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))*lp1
+                        +(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))*lp2
+                        +(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))*lq1
+                        +(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))*lq2)*f_on/tauf)
+    
+            #DT1T2
+            vals +=list(((gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))*lp1
+                        +(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))*lp2
+                        +(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))*lq1
+                        +(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))*lq2)*v1*v2*f_on/tauf)
+            
+            #DT1T1, DT2T2
+            vals += list((fo_connected+fd_connected).dot((-(gf*np.cos(theta1-theta2-thetaf)
+                                                           +bf*np.sin(theta1-theta2-thetaf))*lp1
+                                                         -(gf*np.cos(theta2-theta1+thetaf)
+                                                           +bf*np.sin(theta2-theta1+thetaf))*lp2
+                                                         -(-bf*np.cos(theta1-theta2-thetaf)
+                                                           +gf*np.sin(theta1-theta2-thetaf))*lq1
+                                                         -(-bf*np.cos(theta2-theta1+thetaf)
+                                                           +gf*np.sin(theta2-theta1+thetaf))*lq2)*v1*v2*f_on/tauf))
+    
+            # DV1T1
+            vals += list(fo_connected.dot(((-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))*lp1
+                                           +(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))*lp2
+                                           +(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))*lq1
+                                           +(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))*lq2)
+                                          *v2*f_on/tauf))
+    
+            # DV2T2
+            vals += list(fd_connected.dot(((gf*np.sin(theta1-theta2-thetaf)-bf*np.cos(theta1-theta2-thetaf))*lp1
+                                           +(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))*lp2
+                                           +(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))*lq1
+                                           +(+bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))*lq2)
+                                          *v1*f_on/tauf))
+            
+            
+            # AC Branch limits
+            if branch_lims is True:
+                pfo = f_on*((gf+g_fr)/(tauf*tauf)*v1*v1
+                            -v1*v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*v1*v1
+                            +v1*v2*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                dpdv1 = f_on*(2*(gf+g_fr)/(tauf*tauf)*v1
+                              -v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                dqdv1 = f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf)*v1
+                              +v2*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                dpdv2 = f_on*(-v1*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                dqdv2 = f_on*(v1*(bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+    
+                dpdt1 = f_on*(-v1*v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+    
+                dqdt1 = f_on*(v1*v2*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+    
+                dpdt2 = -1*dpdt1
+    
+                dqdt2 = -1*dqdt1
+    
+                #DV1THETA2
+                dpfo2 = (2*pfo*f_on*(v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dpdv1*dpdt2)
+    
+                dqfo2 = (2*qfo*f_on*(v2*(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dqdv1*dqdt2)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DV2DTHETA1
+                dpfo2 = (2*pfo*f_on*(-v1*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dpdv2*dpdt1)
+    
+                dqfo2 = (2*qfo*f_on*(v1*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dqdv2*dqdt1)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                # DV1DV2
+                dpfo2 = (2*pfo*f_on*(-(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dpdv1*dpdv2)
+    
+                dqfo2 = (2*qfo*f_on*((bf*np.cos(theta1-theta2-thetaf)-gf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dqdv1*dqdv2)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DTHETA1THETA2
+                dpfo2 = (2*pfo*f_on*(-v1*v2*(gf*np.cos(theta1-theta2-thetaf)+bf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dpdt1*dpdt2)
+    
+                dqfo2 = (2*qfo*f_on*(v1*v2*(bf*np.cos(theta1-theta2-thetaf) -gf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dqdt1*dqdt2)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DTHETA1THETA1 and 22
+                dpfo2 = (2*pfo*f_on*(-v1*v2*(-gf*np.cos(theta1-theta2-thetaf) -bf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dpdt1*dpdt1)
+    
+                dqfo2 = (2*qfo*f_on*(v1*v2*(-bf*np.cos(theta1-theta2-thetaf)+gf*np.sin(theta1-theta2-thetaf))/tauf)
+                         +2*dqdt1*dqdt1)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)*2
+    
+                #DV1DV1
+                dpfo2 = (2*pfo*f_on*(2*(gf+g_fr)/(tauf*tauf))+2*dpdv1*dpdv1)
+    
+                dqfo2 = (2*qfo*f_on*(-2*(bf+b_fr+0.5*bfCH)/(tauf*tauf))+2*dqdv1*dqdv1)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DV2DV2 - TO DO!
+                dpfo2 = 2*dpdv2*dpdv2*f_on
+    
+                dqfo2 = 2*dqdv2*dqdv2*f_on
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DV1THETA1
+                dpfo2 = (2*pfo*f_on*(-v2*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dpdv1*dpdt1)
+    
+                dqfo2 = (2*qfo*f_on*(v2*(-bf*np.sin(theta1-theta2-thetaf)-gf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dqdv1*dqdt1)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                #DV2THETA2
+                dpfo2 = (2*pfo*f_on*(v1*(-gf*np.sin(theta1-theta2-thetaf)+bf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dpdv2*dpdt2)
+    
+                dqfo2 = (2*qfo*f_on*(v1*(bf*np.sin(theta1-theta2-thetaf)+gf*np.cos(theta1-theta2-thetaf))/tauf)
+                         +2*dqdv2*dqdt2)
+    
+                vals += list((dpfo2+dqfo2)*lmbda_fc)
+    
+                pfd = f_on*((gf+g_to)*v2*v2
+                            -v1*v2*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                qfd = f_on*(-(bf+b_to+0.5*bfCH)*v2*v2
+                            +v1*v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                dpdv1 = f_on*(-v2*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                dqdv1 = f_on*(v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                dpdv2 = f_on*(2*(gf+g_to)*v2
+                              -v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                dqdv2 = f_on*(-2*(bf+b_to+0.5*bfCH)*v2
+                              +v1*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+    
+                dpdt1 = f_on*(-v2*v1*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+    
+                dqdt1 = f_on*(v2*v1*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+    
+                dpdt2 = -1*dpdt1
+    
+                dqdt2 = -1*dqdt1
+    
+                #DV1THETA2
+                dpfd2 = (2*pfd*f_on*(v2*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dpdv1*dpdt2)
+    
+                dqfd2 = (2*qfd*f_on*(-v2*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dqdv1*dqdt2)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                #DV2DTHETA1
+                dpfd2 = (2*pfd*f_on*(-v1*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dpdv2*dpdt1)
+    
+                dqfd2 = (2*qfd*f_on*(v1*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dqdv2*dqdt1)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                # DV1DV2
+                dpfd2 = (2*pfd*f_on*(-(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dpdv1*dpdv2)
+    
+                dqfd2 = (2*qfd*f_on*((bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dqdv1*dqdv2)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                #DTHETA1THETA2
+                dpfd2 = (2*pfd*f_on*(-v2*v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dpdt1*dpdt2)
+    
+                dqfd2 = (2*qfd*f_on*(v1*v2*(bf*np.cos(theta2-theta1+thetaf)-gf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dqdt1*dqdt2)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                #DTHETA1THETA1 and 22
+                dpfd2 = (2*pfd*f_on*(v2*v1*(gf*np.cos(theta2-theta1+thetaf)+bf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dpdt1*dpdt1)
+    
+                dqfd2 = (2*qfd*f_on*(v1*v2*(-bf*np.cos(theta2-theta1+thetaf)+gf*np.sin(theta2-theta1+thetaf))/tauf)
+                         +2*dqdt1*dqdt1)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)*2
+    
+                #DV1DV1
+                dpfd2 = 2*dpdv1*dpdv1*f_on
+    
+                dqfd2 = 2*dqdv1*dqdv1*f_on
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                #DV2DV2 - TO DO!
+                dpfd2 = (2*pfd*f_on*2*(gf+g_to))+2*dpdv2*dpdv2
+    
+                dqfd2 = (2*qfd*f_on*-2*(bf+b_to+0.5*bfCH))+2*dqdv2*dqdv2
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+                # got to here
+    
+                #DV1THETA1
+                dpfd2 = (2*pfd*f_on*(-v2*(gf*np.sin(theta2-theta1+thetaf)-bf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dpdv1*dpdt1)
+    
+                dqfd2 = (2*qfd*f_on*(v2*(bf*np.sin(theta2-theta1+thetaf)+gf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dqdv1*dqdt1)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+    
+                #DV2THETA2
+                dpfd2 = (2*pfd*f_on*(-v1*(-gf*np.sin(theta2-theta1+thetaf)+bf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dpdv2*dpdt2)
+    
+                dqfd2 = (2*qfd*f_on*(v1*(-bf*np.sin(theta2-theta1+thetaf)-gf*np.cos(theta2-theta1+thetaf))/tauf)
+                         +2*dqdv2*dqdt2)
+    
+                vals += list((dpfd2+dqfd2)*lmbda_fc2)
+            
+            if branch_slacks is True:
+                vals += list(-2*lmbda_fc)+list(-2*lmbda_fc2)
+                                         
+            return vals
+        
+        def hessianstructure(self):
+            if branch_slacks is True:
+                return (r_idx2+list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2,
+                        c_idx2+list(range(6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3,6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t))*2)
+            else:
+                return (r_idx2,c_idx2)
+        
+        def constraints(self,x):
+            #print(x)
+            # FIRST: POWER BALANCE
+            v = x[:n_b*n_t] # v11... v21... vNbNt
+            theta = x[n_b*n_t:2*n_b*n_t]
+            pje = x[2*n_b*n_t:2*n_b*n_t+n_je]
+            qj = x[2*n_b*n_t+n_je:2*n_b*n_t+n_je+n_j*n_t]
+            pdc = x[2*n_b*n_t+n_je+n_j*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t]
+            qdc_fr = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2]
+            qdc_to = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*2:2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            p_slacksP = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            p_slacksM = x[3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            q_slacksP = x[4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            q_slacksM = x[5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+            sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+    
+            # power balance constraint
+            pb = np.zeros((n_b*n_t,))
+            qb = np.zeros((n_b*n_t,))
+            
+            # devices
+            pb += je_connected.dot(pje)##je_on
+            pb += j_connected.dot(pj_min) # uncontrollable devices
+            pb += pj_sdsu # start up / shut down curves
+            qb += j_connected.dot(qj*j_on)
+            
+            # shunts - assuming fixed to initial position
+            pb -= s_connected.dot(gs*ush0)*v*v
+            qb += s_connected.dot(bs*ush0)*v*v
+            
+            # branches - group lines and transformers 
+            thetai = fo_connected.transpose().dot(theta)*f_on
+            thetaj = fd_connected.transpose().dot(theta)*f_on
+            vi = fo_connected.transpose().dot(v)*f_on
+            vj = fd_connected.transpose().dot(v)*f_on
+            
+            
+            # ac branch power balance
+            pb -= fo_connected.dot(f_on*(gf+g_fr)/(tauf*tauf))*v*v
+            
+            pb -= fd_connected.dot((gf+g_to)*f_on)*v*v
+            pb += fo_connected.dot((gf*np.cos(thetai-thetaj-thetaf)
+                                    +bf*np.sin(thetai-thetaj-thetaf))*vi*vj/tauf)
+            pb += fd_connected.dot((gf*np.cos(thetaj-thetai+thetaf)
+                                    +bf*np.sin(thetaj-thetai+thetaf))*vi*vj/tauf)
+    
+            qb += fo_connected.dot(f_on*(bf+b_fr+0.5*bfCH)/(tauf*tauf))*v*v
+            qb += fd_connected.dot(f_on*(bf+b_to+0.5*bfCH))*v*v
+            qb += fo_connected.dot((-bf*np.cos(thetai-thetaj-thetaf)
+                                    +gf*np.sin(thetai-thetaj-thetaf))*vi*vj/tauf)
+            qb += fd_connected.dot((-bf*np.cos(thetaj-thetai+thetaf)
+                                    +gf*np.sin(thetaj-thetai+thetaf))*vi*vj/tauf)
+          
+        
+            # dc lines power balance
+            pb += do_connected.dot(pdc)
+            pb -= dd_connected.dot(pdc)
+            qb += do_connected.dot(qdc_fr)
+            qb += dd_connected.dot(qdc_to)
+            
+            # NEXT: DEVICE RAMPING - will need to remove for device switching (or can do in bounds?)
+            pj = je_j.dot(pje)+pj_min
+            pj_ramp = np.concatenate((pj[:n_j]-pj0,pj[n_j:]-pj[:n_j*(n_t-1)])) # diff
+            
+            # Fixed power factor
+            qc = q0 + qc_j.dot(pj)*beta - qc_j.dot(qj*j_on)
+            
+            # Bounded power factor
+            qb_ub = qb_j.dot(qj*j_on) - q0max - qb_j.dot(pj)*beta_max
+            qb_lb = q0min + qb_j.dot(pj)*beta_min - qb_j.dot(qj*j_on)
+            
+            # DEVICE ENERGY LIMITS
+            
+            # Branch limits
+            if branch_lims is True:
+                pfo = f_on*((gf+g_fr)/(tauf*tauf)*vi*vi
+                            -vi*vj*(gf*np.cos(thetai-thetaj-thetaf)+bf*np.sin(thetai-thetaj-thetaf))/tauf)
+                qfo = f_on*(-(bf+b_fr+0.5*bfCH)/(tauf*tauf)*vi*vi
+                            +vi*vj*(bf*np.cos(thetai-thetaj-thetaf)-gf*np.sin(thetai-thetaj-thetaf))/tauf)
+                pfd = f_on*((gf+g_to)*vj*vj
+                            -vi*vj*(gf*np.cos(thetaj-thetai+thetaf)+bf*np.sin(thetaj-thetai+thetaf))/tauf)
+                qfd = f_on*(-(bf+b_to+0.5*bfCH)*vj*vj
+                            +vi*vj*(bf*np.cos(thetaj-thetai+thetaf)-gf*np.sin(thetaj-thetai+thetaf))/tauf)
+            
+            
+            # FINALLY: SLACK VARIABLES (PROBABLY)
+            if bus_slacks is True:
+                pb += p_slacksP-p_slacksM
+                qb += q_slacksP-q_slacksM
+                
+            if branch_slacks is True:
+                fc = pfo*pfo+qfo*qfo-(sf+sf_slacks)*(sf+sf_slacks)
+                fc2 = pfd*pfd+qfd*qfd-(sf+sf_slacks)*(sf+sf_slacks)
+            elif branch_lims is True:
+                fc = pfo*pfo+qfo*qfo-(sf*sf)
+                fc2 = pfd*pfd+qfd*qfd-(sf*sf)
+            else:
+                return np.concatenate((pb,qb,pj_ramp,qc,qb_lb,qb_ub))
+                
+                
+            return np.concatenate((pb,qb,pj_ramp,qc,qb_lb,qb_ub,fc,fc2))
+    
+        
+    # HUGE REMINDER: PJ_min is the uncontrollable device output! The lower bounds on pj is zero for all je
+    if bus_slacks == True and branch_slacks == True:
+        x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                             pdc0,qdc_fr0,qdc_to0,np.zeros(n_b*n_t*4+n_f*n_t)))
+        lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                             pdc_max*-1,qdc_fr_min,qdc_to_min,
+                             np.zeros(n_b*n_t*4+n_f*n_t)))
+        ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                             pdc_max,qdc_fr_max,qdc_to_max,
+                             np.array([2.]*(n_b*n_t*4)+[100.]*(n_f*n_t))))
+    elif bus_slacks == True:
+        x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                             pdc0,qdc_fr0,qdc_to0,np.zeros(n_b*n_t*4)))
+        lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                             pdc_max*-1,qdc_fr_min,qdc_to_min,
+                             np.zeros(n_b*n_t*4)))
+        ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                             pdc_max,qdc_fr_max,qdc_to_max,
+                             np.array([2.]*(n_b*n_t*4))))
+    else:
+        x0 = np.concatenate((v0,theta0,pje0,np.array(list(qj0)*n_t),
+                             pdc0,qdc_fr0,qdc_to0))
+        lb = np.concatenate((v_min,np.array([-np.pi]*(n_b*n_t)),np.zeros((n_je,)),qj_min,
+                             pdc_max*-1,qdc_fr_min,qdc_to_min))
+        ub = np.concatenate((v_max,np.array([np.pi]*(n_b*n_t)),pje_max,qj_max,
+                             pdc_max,qdc_fr_max,qdc_to_max))
+    
+    #x0 = 0.5*(lb+ub)
+    for i in range(len(x0)):
+        #if ub[i] < lb[i]:
+        #    print(ub[i],x0[i],lb[i])
+        if ub[i] < x0[i]:
+            x0[i] = ub[i]
+        #    print(ub[i],x0[i],lb[i])
+        #if lb[i] > x0[i]:
+        #    print(ub[i],x0[i],lb[i])
+    
+    if branch_lims is True and q_bounds is True:
+        cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)+[None]*(n_qb*n_t*2+n_f*n_t*2)
+        cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t+n_qb*n_t*2+n_f*n_t*2)
+    elif q_bounds is True:
+        cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)+[None]*(n_qb*n_t*2)
+        cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t+n_qb*n_t*2)
+    else:
+        cl=[0.0]*(n_b*n_t*2)+list(prdn)+[0.]*(n_qc*n_t)
+        cu=[0.0]*(n_b*n_t*2)+list(prup)+[0.]*(n_qc*n_t)
+    
+    nlp = ipopt.problem(n=len(x0), m=len(cu), problem_obj=acopf(),
+                        lb=lb, ub=ub, cl=cl, cu=cu)
+    
+    '''
+    print('CONSTRAINTS')
+    print(n_b*n_t*2+len(prdn))
+    print(n_b*n_t*2+len(prdn)+n_qc*n_t)
+    print(n_b*n_t*2+len(prdn)+n_qc*n_t+n_qb*n_t)
+    print(n_b*n_t*2+len(prdn)+n_qc*n_t+n_qb*n_t*2)
+    print("VARS")
+    print(n_b*n_t*2)
+    print(n_b*n_t*2+n_je)
+    print(n_b*n_t*2+n_je+n_j*n_t)
+    #'''
+    
+    #nlp.addOption('derivative_test', 'first-order')
+    nlp.addOption("constr_viol_tol",1e-9)
+    nlp.addOption("dual_inf_tol",1e4)
+    nlp.addOption("compl_inf_tol",1e4)
+    if n_b > 2000:
+        nlp.addOption("tol",1e-4)
+    else:
+        nlp.addOption("tol",1e-4)
+    
+    
+    for i in range(len(x0)):
+        if x0[i] > ub[i]:
+            x0[i] = ub[i]
+        if x0[i] < lb[i]:
+            x0[i] = lb[i]
+        if lb[i] > ub[i]:
+            print('Inconsistent bound: ',end='')
+            print(i)
+    
+    t1 = time.time()
+    print('BUILD TIME TAKEN: '+str(t1-t0_))
+    t2 = time.time()
+    x, info = nlp.solve(x0)
+    t3 = time.time()
+    
+    print('SOLVER TIME TAKEN: '+str(t3-t2))
+    
+    
+    
+    
+    
+# In-Home OBJ
+#print('OBJ_In_Home: ' + str(-1*(info['obj_val']+ZON+ZSU+ZSD)))
+#print('ZON :'+str(ZON))
+#print('ZSU :'+str(ZSU))
+#print('ZSD :'+str(ZSD))
+
+
+
+# # Analysis        
+# # device cost
+# pje_cost_tot=sum(x[2*n_b*n_t:2*n_b*n_t+n_je]*c_en*delta_tj) 
+# print('pje_cost_tot :'+str(pje_cost_tot))
+
+# p_slacksP = x[2*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]   
+# p_slacksP_cost_tot=sum(p_slacksP*delta_tb*pviol_cost)    
+# print('p_slacksP_cost_tot :'+str(p_slacksP_cost_tot))
+
+
+# p_slacksM = x[3*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+# p_slacksM_cost_tot=sum(p_slacksM*delta_tb*pviol_cost)
+# print('p_slacksM_cost_tot :'+str(p_slacksM_cost_tot))
+
+# q_slacksP = x[4*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+# q_slacksP_cost_tot=sum(q_slacksP*delta_tb*qviol_cost)
+# print('q_slacksP_cost_tot :'+str(q_slacksP_cost_tot))
+
+# q_slacksM = x[5*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3]
+# q_slacksM_cost_tot=sum(q_slacksM*delta_tb*qviol_cost)
+# print('q_slacksM_cost_tot :'+str(q_slacksM_cost_tot))
+
+# sf_slacks = x[6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3:6*n_b*n_t+n_je+n_j*n_t+n_dc*n_t*3+n_f*n_t]
+
+# if len(sf_slacks)>0:
+#     sf_slacks_cost_tot=sum(sf_slacks*delta_tf*sviol_cost)
+#     print('sf_slacks_cost_tot :'+str(sf_slacks_cost_tot))
+# else:
+#     print('sf_slacks_cost_tot :'+str(0))
+
+    
+
+reserves = {}
+# write solution as back up
+
+if div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    pj_min=pj_min_all
+    pj_max=pj_max_all
+
+    j_t_je_map=j_t_je_map_all
+    n_je=n_je_all
+    ush0 = np.array(list(ush0)*n_t_)
+    thetaf= np.array(list(thetaf)*n_t_)
+    tauf = np.array(list(tauf)*n_t_)
+    f_on= np.array(list(f_on)*n_t_)
+    
+    # update x:
+    Xx=[]
+  
+    for t in range(n_t_):
+        Xx+=list(X[t][:n_b])
+    for t in range(n_t_):        
+        Xx+=list(X[t][n_b:2*n_b])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b:2*n_b+n_je_tt[t]])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b+n_je_tt[t]:2*n_b+n_je_tt[t]+n_j])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b+n_je_tt[t]+n_j:2*n_b+n_je_tt[t]+n_j+n_dc])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b+n_je_tt[t]+n_j+n_dc:2*n_b+n_je_tt[t]+n_j+n_dc*2])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b+n_je_tt[t]+n_j+n_dc*2:2*n_b+n_je_tt[t]+n_j+n_dc*3])
+    for t in range(n_t_):         
+        Xx+=list(X[t][2*n_b+n_je_tt[t]+n_j+n_dc*3:3*n_b+n_je_tt[t]+n_j+n_dc*3])
+    for t in range(n_t_):         
+        Xx+=list(X[t][3*n_b+n_je_tt[t]+n_j+n_dc*3:4*n_b+n_je_tt[t]+n_j+n_dc*3])
+    for t in range(n_t_):         
+        Xx+=list(X[t][4*n_b+n_je_tt[t]+n_j+n_dc*3:5*n_b+n_je_tt[t]+n_j+n_dc*3])
+    for t in range(n_t_):         
+        Xx+=list(X[t][5*n_b+n_je_tt[t]+n_j+n_dc*3:6*n_b+n_je_tt[t]+n_j+n_dc*3])
+    for t in range(n_t_):         
+        Xx+=list(X[t][6*n_b+n_je_tt[t]+n_j+n_dc*3:6*n_b+n_je_tt[t]+n_j+n_dc*3+n_f*n_t]) 
+    x=Xx    
+
+    
+if n_b<2000:
+    write_solution(outfile, src_data, x, ush0, thetaf, tauf, n_t_, n_b, n_s, n_j, n_je, n_f, n_dc,
+               pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+    
+elif div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    write_solution(outfile, src_data, x, ush0, thetaf, tauf, n_t_, n_b, n_s, n_j, n_je, n_f, n_dc,
+               pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+else: # one-step Ipopt
+    write_solution_single_timestep(outfile, src_data, x, ush0, thetaf, tauf, n_t0, n_b, n_s, n_j, n_je, n_f, n_dc,
+                                   pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves) 
+
+
+# if n_t == 1:
+#     write_solution_single_timestep(outfile, src_data, x, ush0, thetaf, tauf, n_t0, n_b, n_s, n_j, n_je, n_f, n_dc,
+#                                    pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+# else:    
+#     write_solution(outfile, src_data, x, ush0, thetaf, tauf, n_t, n_b, n_s, n_j, n_je, n_f, n_dc,
+#                    pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+
+#'''
+# This section is trying to allocate device reserves after the fact - may not be ready in time
+
+file = open(src_data)
+data = json.load(file)
+
+# import sys
+# sys.exit()
+
+# %%
+# This section is related to reserves
+
+# Try to calculate reserves
+# if n_t > 1:
+#     pje = x[2*n_b*n_t:2*n_b*n_t+n_je]
+#     pj = je_j.dot(pje)+pj_min
+# else:
+#     pje = x[2*n_b:2*n_b+n_je]
+#     pj = np.array(list(je_j.dot(pje)+pj_min)*n_t)
+#     j_sgn = np.array(list(j_sgn)*n_t)
+    
+# je_j = coo_matrix(([1.]*len(rows3), (rows3, cols3)),shape=(n_j*n_t_,n_je))
+
+#'''
+if div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    je_j = coo_matrix(([1.]*len(rows3_all), (rows3_all, cols3_all)),shape=(n_j*n_t_,n_je_all))
+
+    
+    
+if n_b<2000:
+    n_tt=n_t_
+elif div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    n_tt=n_t_   
+    pjj_sdsu = np.array(list(pj_sdsu)*n_tt)
+else: # one-step Ipopt
+    n_tt=1
+   
+# if n_t>1 or div==1: normal  # write
+#     n_tt=n_t 
+# else:                        
+#     n_tt=n_t_
+   
+
+
+
+    
+pje = x[2*n_b*n_tt:2*n_b*n_tt+n_je]
+pj = je_j.dot(pje)+pj_min
+
+# if n_t==1 and div>1:
+if div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    j_sgn = np.array(list(j_sgn)*n_tt)
+    
+p_pr = copy.deepcopy(pj)*(j_sgn+1)*0.5
+p_co = copy.deepcopy(pj)*(j_sgn-1)*0.5
+# j_connected = coo_matrix((vals2, (rows2, cols2)), shape=(n_b*n_t_,n_j*n_t_))
+if div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    j_connected = coo_matrix((vals2_all, (rows2_all, cols2_all)), shape=(n_b*n_t_,n_j*n_t_))
+
+p_pr = j_connected.dot(p_pr) # this will include sign so we can separate out 
+p_co = j_connected.dot(p_co) # this will include sign so we can separate out 
+
+
+
+if n_b > 20000:
+    p_cutoff = 1e8
+else:
+    p_cutoff = 1e4
+    
+# In future we may consider changing the order to do less valuable reserve products first
+
+for z in range(n_az):
+    
+    # get list of devices in the zone
+    j_zn = []
+    for j in range(n_j):
+        if azn[z][j_bus_map[j]] == 1:
+            j_zn.append(j)
+            if j not in reserves:
+                reserves[j] = {'ru':[0.]*n_tt,'rd':[0.]*n_tt,'s':[0.]*n_tt,'ns':[0.]*n_tt,'rru':[0.]*n_tt,'rrd':[0.]*n_tt}
+
+        
+    for t in range(n_tt):
+        # create a list of devices 
+        devices = []
+        for j in j_zn:
+            if j_on[j+t*n_j] == 0:
+                continue
+            if j in bad_devices:
+                continue
+            # for qc we can provide p but NO q, for qb p can affect bound (maybe skip)
+            if j_sgn[j+t*n_j] == 1: # producers
+                devices.append([prgu_cost[j+t*n_j],
+                                min(min(min(rru_on_ub[j]-reserves[j]['ru'][t],prgu_ub[j]-reserves[j]['ru'][t]),
+                                        syn_ub[j]-reserves[j]['ru'][t]),
+                                    pj_max[j+t*n_j]-pj[j+t*n_j]-reserves[j]['ru'][t]),j])
+            else:
+                devices.append([prgu_cost[j+t*n_j],
+                                min(min(min(rru_on_ub[j]-reserves[j]['ru'][t],prgu_ub[j]-reserves[j]['ru'][t]),
+                                        syn_ub[j]),pj[j+t*n_j]-pj_min[j+n_j*t]-reserves[j]['ru'][t]),j])
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        ru_req = sum(p_co[t*n_b:(t+1)*n_b]*azn[z])*data['network']['active_zonal_reserve'][z]['REG_UP']
+        while (len(devices)>1 and (ru_req > 0 or devices[0][0]<p_cutoff)):
+            p = max(0,devices[0][1])
+            j = devices[0][2]
+            reserves[j]['ru'][t] += p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            ru_req -= p
+        
+        # other p products here - same devices list
+        rd_req = sum(data['network']['active_zonal_reserve'][z]['REG_DOWN']*p_co[t*n_b:(t+1)*n_b]*azn[z])
+        devices = []
+        for j in j_zn: 
+            if j_on[j+t*n_j] == 0:
+                continue
+            if j in bad_devices:
+                continue
+            if j_sgn[j+t*n_j] == 1: # producers
+                if min(prgd_ub[j],pj[j+t*n_j]-pj_min[j+n_j*t]) > 0:
+                    devices.append([prgd_cost[j+t*n_j],
+                                    min(min(prgd_ub[j],pj[j+t*n_j]-pj_min[j+n_j*t]),rrd_on_ub[j]),j])
+            elif min(prgd_ub[j],pj_max[j+t*n_j]-pj[j+t*n_j])>0:
+                devices.append([prgd_cost[j+t*n_j],
+                                min(rrd_on_ub[j],min(prgd_ub[j],pj_max[j+t*n_j]-pj[j+t*n_j])),j])
+                
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        while ((rd_req > 0 or devices[0][0] < p_cutoff) and len(devices)>1):
+            p = max(0,devices[0][1])
+            j = devices[0][2]
+            reserves[j]['rd'][t] = p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            rd_req -= p
+            
+        max_pr = max(p_co[t*n_b:(t+1)*n_b]*azn[z])
+        syn_req = data['network']['active_zonal_reserve'][z]['SYN']*max_pr
+        devices = []
+        for j in j_zn:
+            if j_on[j+t*n_j] == 0:
+                continue
+            if j in bad_devices:
+                continue
+            if j_sgn[j+t*n_j] == 1: # producers
+                devices.append([syn_cost[j+t*n_j],
+                                min(min(syn_ub[j]-reserves[j]['ru'][t]-reserves[j]['s'][t],
+                                        rru_on_ub[j]-reserves[j]['rru'][t]-reserves[j]['ru'][t]-reserves[j]['s'][t]),
+                                    pj_max[j+t*n_j]-pj[j+t*n_j]-reserves[j]['ru'][t]-reserves[j]['s'][t]),j])
+            else:
+                devices.append([syn_cost[j+t*n_j],
+                                min(min(syn_ub[j]-reserves[j]['ru'][t]-reserves[j]['s'][t],
+                                        rru_on_ub[j]-reserves[j]['rru'][t]-reserves[j]['ru'][t]-reserves[j]['s'][t]),
+                                    pj[j+t*n_j]-reserves[j]['ru'][t]-reserves[j]['s'][t]-pj_min[j+n_j*t]),j])
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        while ((syn_req > 0 or devices[0][0] < p_cutoff) and len(devices)>1):
+            p = max(0,devices[0][1])#min(devices[0][1],syn_req))
+            j = devices[0][2]
+            reserves[j]['s'][t] += p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            syn_req -= p
+            
+        # now q products
+        #devices = []
+        #for j in j_zn:
+        
+        nsyn_req = data['network']['active_zonal_reserve'][z]['NSYN']*max_pr
+        # Note: as patch preventing devices which are EVER on from providing NSYN
+        devices = []
+        for j in j_zn:
+            skip = False
+            if j in bad_devices:
+                continue
+            if j_on[j+t*n_j] == 1:
+                continue
+            for t2 in range(n_t):
+                if j_on[j+(t2)*n_j] == 1:
+                    skip = True
+            if data['network']['simple_dispatchable_device'][j]['initial_status']['on_status'] == 1:
+                continue
+            if skip is True:
+                continue
+                
+            if j_sgn[j+t*n_j] == 1: # producers
+                devices.append([nsyn_cost[j+t*n_j],
+                                min(min(min(nsyn_ub[j]-reserves[j]['ns'][t],rru_off_ub[j]-reserves[j]['ns'][t]),
+                                        pj_max[j+t*n_j]-pjj_sdsu[j+t*n_j]-reserves[j]['ns'][t]),rru_off_ub[j]-reserves[j]['ns'][t]),j])
+
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        while ((nsyn_req > 0 or devices[0][0]<p_cutoff) and len(devices)>1):
+            p = max(0,devices[0][1])
+            j = devices[0][2]
+            reserves[j]['ns'][t] += p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            nsyn_req -= p
+            
+        rru_req = data['time_series_input']['active_zonal_reserve'][z]['RAMPING_RESERVE_UP'][t]
+        devices = []
+        for j in j_zn:
+            if j in bad_devices:
+                continue
+            if t < n_t-1:
+                if j_on[j+(t+1)*n_j] == 0:
+                    continue
+            if j_sgn[j+t*n_j] == 1: # producers
+                if j_on[j+t*n_j] == 1:
+                    devices.append([cru_on[j+t*n_j],min(rru_on_ub[j]-reserves[j]['rru'][t]-reserves[j]['ru'][t]-reserves[j]['s'][t],
+                                                        pj_max[j+t*n_j]-pj[j+t*n_j]-reserves[j]['ru'][t]-reserves[j]['rru'][t]-reserves[j]['s'][t]),j])
+                else:
+                    continue # for now
+                    #devices.append([cru_off[j+t*n_j],min(rru_off_ub[j]-reserves[j]['ns'][t],pj_max[j+t*n_j]-),j])
+            else: # consumers
+                if j_on[j+t*n_j] == 1:
+                    devices.append([cru_on[j+t*n_j],min(rru_on_ub[j]-reserves[j]['rru'][t]-reserves[j]['ru'][t]-reserves[j]['s'][t],
+                                                        pj[j+t*n_j]-pj_min[j+n_j*t]-reserves[j]['ru'][t]-reserves[j]['rru'][t]-reserves[j]['s'][t]),j])
+                
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        while ((rru_req > 0 or devices[0][0]<p_cutoff) and len(devices)>1):
+            p = max(0,devices[0][1])#min(rru_req,devices[0][1]))
+            j = devices[0][2]
+            reserves[j]['rru'][t] += p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            rru_req -= p
+            
+        rrd_req = data['time_series_input']['active_zonal_reserve'][z]['RAMPING_RESERVE_DOWN'][t]
+        devices = []
+        for j in j_zn:
+            if j in bad_devices:
+                continue
+            if j_sgn[j+t*n_j] == 1: # producers
+                if j_on[j+t*n_j] == 1:
+                    devices.append([crd_on[j+t*n_j],min(rrd_on_ub[j]-reserves[j]['rd'][t],
+                                                        pj[j+t*n_j]-pj_min[j+n_j*t]-reserves[j]['rd'][t]),j])
+            else: # consumers
+                if j_on[j+t*n_j] == 1:
+                    devices.append([crd_on[j+t*n_j],min(rrd_on_ub[j]-reserves[j]['rd'][t],pj_max[j+t*n_j]-pj[j+t*n_j]-reserves[j]['rd'][t]),j])
+                
+        devices = sorted(devices)
+        devices.append([np.inf,0])
+        while ((rrd_req > 0 or devices[0][0]<p_cutoff) and len(devices)>1):
+            p = max(0,devices[0][1])
+            j = devices[0][2]
+            reserves[j]['rrd'][t] = p
+            devices[0][1] -= p
+            if devices[0][1] <= 0:
+                devices = devices[1:]
+            rrd_req -= p
+
+
+        
+# print('There were ',end='')
+# print(str(len(bad_devices)),end=' ')
+# print('bad devices')
+
+# print('b:',end=' ')
+# print(sum(bs_*ush0))
+# print('g:',end=' ')
+# print(sum(gs_*ush0))
+
+
+
+
+
+if n_b<2000:
+    write_solution(outfile, src_data, x, ush0, thetaf, tauf, n_t_, n_b, n_s, n_j, n_je, n_f, n_dc,
+               pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+    
+elif div>1 and (n_b==4224 or n_b==6049 or n_b==6708): # Seq-Ipopt large Networks (4224/6049) divsion 2 & 3
+    write_solution(outfile, src_data, x, ush0, thetaf, tauf, n_t_, n_b, n_s, n_j, n_je, n_f, n_dc,
+               pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves)
+    
+else: # one-step Ipopt
+    write_solution_single_timestep(outfile, src_data, x, ush0, thetaf, tauf, n_t0, n_b, n_s, n_j, n_je, n_f, n_dc,
+                                   pj_min, j_on, f_on, bus_map, shunt_map, j_map, j_t_je_map, branch_map, dc_map, reserves) 
